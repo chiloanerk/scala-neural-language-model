@@ -1,0 +1,20 @@
+# Build outputs
+target/
+project/target/
+project/project/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS files
+.DS_Store
+
+# Data files (except example)
+data/**/*.ckpt
+data/**/*.txt
+!data/**/example-corpus.txt
+
+# Logs
+*.log
