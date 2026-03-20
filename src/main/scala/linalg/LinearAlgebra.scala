@@ -18,6 +18,10 @@ object LinearAlgebra:
 
   def scalarMul(a: Vec, s: Double): Vec = a.map(_ * s)
 
+  def hadamard(a: Vec, b: Vec): Vec =
+    requireSameLength(a, b, "hadamard")
+    a.indices.map(i => a(i) * b(i)).toVector
+
   def dot(a: Vec, b: Vec): Double =
     requireSameLength(a, b, "dot")
     var sum = 0.0
@@ -42,6 +46,14 @@ object LinearAlgebra:
     Matrix.fromFunction(a.length, b.length)((r, c) => a(r) * b(c))
 
   def tanhVec(v: Vec): Vec = v.map(tanh)
+
+  def relu(v: Vec): Vec = v.map(x => math.max(0.0, x))
+
+  def reluGrad(v: Vec): Vec = v.map(x => if x > 0 then 1.0 else 0.0)
+
+  def tanhGrad(v: Vec): Vec =
+    val tanhV = v.map(tanh)
+    tanhV.map(x => 1.0 - x * x)
 
   def softmaxStable(logits: Vec): Vec =
     require(logits.nonEmpty, "softmax requires non-empty vector")

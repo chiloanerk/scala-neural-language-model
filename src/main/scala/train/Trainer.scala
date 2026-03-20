@@ -12,7 +12,9 @@ final case class TrainConfig(
     l2: Double = 0.0,
     clipNorm: Option[Double] = None,
     shuffleEachEpoch: Boolean = true,
-    seed: Int = 42
+    seed: Int = 42,
+    patience: Int = 0,  // 0 = disabled, >0 = early stopping enabled
+    activation: String = "tanh"
 )
 
 final case class EpochMetrics(epoch: Int, trainLoss: Double, valLoss: Double, valPerplexity: Double, learningRate: Double)
@@ -20,22 +22,37 @@ final case class TrainResult(params: Params, history: Vector[EpochMetrics])
 
 object Trainer:
 
+  // Progress bar helper (package-private for testing)
+  private[train] def createProgressBar(percent: Int, width: Int = 20): String =
+    val filled = (percent * width) / 100
+    val empty = width - filled
+    val bar = "█" * filled + "░" * empty
+    s"[$bar]"
+
   def train(initial: Params, trainSet: Vector[Example], valSet: Vector[Example], cfg: TrainConfig): TrainResult =
     require(cfg.epochs >= 1, s"epochs must be >= 1, got ${cfg.epochs}")
     require(cfg.learningRate > 0.0, s"learningRate must be > 0, got ${cfg.learningRate}")
     require(cfg.lrDecay > 0.0, s"lrDecay must be > 0, got ${cfg.lrDecay}")
+    require(cfg.patience >= 0, s"patience must be >= 0, got ${cfg.patience}")
 
     var params = initial
     var lr = cfg.learningRate
     var history = Vector.empty[EpochMetrics]
 
+    // Early stopping state
+    var bestParams = initial
+    var bestValLoss = Double.MaxValue
+    var bestEpoch = 0
+    var patienceCounter = 0
+
     val totalExamples = trainSet.length
-    val progressInterval = math.max(1000, totalExamples / 20) // Print every 5% or 1000 examples
+    // Show progress every 10% or every 100 examples, whichever is smaller
+    val progressInterval = math.max(100, totalExamples / 10)
 
     var epoch = 1
     while epoch <= cfg.epochs do
       println(f"Epoch $epoch/$cfg.epochs starting (lr=$lr%.4f, examples=$totalExamples)...")
-      
+
       val startTime = System.currentTimeMillis()
       val rnd = Random(cfg.seed + epoch)
       val epochData = if cfg.shuffleEachEpoch then rnd.shuffle(trainSet) else trainSet
@@ -43,32 +60,56 @@ object Trainer:
       var lossSum = 0.0
       var seen = 0
       epochData.foreach { ex =>
-        val (updated, loss) = LanguageModel.trainStep(params, ex, lr, l2 = cfg.l2, clipNorm = cfg.clipNorm)
+        val (updated, loss) = LanguageModel.trainStep(params, ex, lr, l2 = cfg.l2, clipNorm = cfg.clipNorm, activation = cfg.activation)
         params = updated
         lossSum += loss
         seen += 1
-        
+
         if seen % progressInterval == 0 then
           val elapsed = (System.currentTimeMillis() - startTime) / 1000.0
           val progress = (seen.toDouble / totalExamples) * 100
           val avgLoss = lossSum / seen
-          println(f"  Progress: $progress%.0f%% ($seen/$totalExamples examples, ${elapsed}%.1fs, avg_loss=$avgLoss%.4f)")
+          val examplesPerSec = seen.toDouble / elapsed
+          val estimatedTotal = totalExamples.toDouble / examplesPerSec
+          val remaining = estimatedTotal - elapsed
+          val bar = createProgressBar(progress.toInt)
+          println(f"  $bar $progress%3.0f%% | ${elapsed}%.1fs/${remaining}%.1fs | ${examplesPerSec}%.0f ex/s | loss=$avgLoss%.4f")
       }
 
       val trainLoss = if seen == 0 then 0.0 else lossSum / seen.toDouble
       val epochTime = (System.currentTimeMillis() - startTime) / 1000.0
-      
+
       println(f"  Epoch $epoch complete in ${epochTime}%.1fs - train_loss=$trainLoss%.6f")
       println(f"  Computing validation metrics...")
-      
-      val valLoss = Metrics.meanLoss(params, valSet)
+
+      val valLoss = Metrics.meanLoss(params, valSet, cfg.activation)
       val ppl = Metrics.perplexity(valLoss)
       println(f"  val_loss=$valLoss%.6f val_ppl=$ppl%.4f")
-      
+
       history :+= EpochMetrics(epoch, trainLoss, valLoss, ppl, lr)
+
+      // Early stopping check
+      if cfg.patience > 0 then
+        if valLoss < bestValLoss then
+          bestValLoss = valLoss
+          bestParams = params
+          bestEpoch = epoch
+          patienceCounter = 0
+          println(f"  New best model! val_loss=$bestValLoss%.6f")
+        else
+          patienceCounter += 1
+          println(f"  No improvement (patience: ${patienceCounter}/${cfg.patience})")
+          if patienceCounter >= cfg.patience then
+            println(f"  Early stopping triggered at epoch $epoch (best: epoch $bestEpoch)")
+            epoch = cfg.epochs + 1 // Exit loop
+      else
+        bestParams = params // No early stopping, use final params
 
       lr *= cfg.lrDecay
       epoch += 1
 
+    if cfg.patience > 0 && bestEpoch < history.length then
+      println(f"Restoring best model from epoch $bestEpoch (val_loss=$bestValLoss%.6f)")
+
     println("Training complete!")
-    TrainResult(params = params, history = history)
+    TrainResult(params = bestParams, history = history)

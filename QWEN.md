@@ -3,24 +3,23 @@
 ## Quick Start
 
 ```bash
-# 1. Run tests
-sbt "runMain app.TestRunner"
+# 1. Interactive training (recommended)
+sbt "runMain app.Main train"
 
-# 2. Train a model (using included example corpus)
-sbt "runMain app.Main train --input data/2026-03-17/example-corpus.txt --model data/2026-03-17/model.ckpt --vocab data/2026-03-17/vocab.txt --epochs 10"
+# 2. Quick command-line training
+sbt "runMain app.Main train --preset balanced --input data/2026-03-17/example-corpus.txt"
 
 # 3. Predict next words
-sbt 'runMain app.Main predict --model data/2026-03-17/model.ckpt --vocab data/2026-03-17/vocab.txt --context "the cat" --topK 5'
+sbt "runMain app.Main predict --context 'the cat' --topK 5"
 ```
 
 ## Project Overview
 
-This is a **pure Scala 3 implementation of a neural language model** built from scratch without any ML libraries. The project implements a next-word prediction model using:
+This is a **pure Scala 3 implementation of a neural language model** built from scratch without any ML libraries.
 
-- **Architecture**: Embedding layer → Hidden layer (Tanh activation) → Output layer (Softmax)
-- **Manual backpropagation**: Custom forward/backward pass implementation
-- **Flat matrix representation**: `Matrix` type using `Vector[Double]` with transpose view (no eager copy)
-- **Training**: SGD with optional gradient clipping, L2 regularization, and learning rate decay
+**What it does:** Given some text context, predicts the most likely next word.
+
+**Architecture:** Embedding layer → Hidden layer (Tanh) → Output layer (Softmax)
 
 ## Technology Stack
 
@@ -49,67 +48,78 @@ This is a **pure Scala 3 implementation of a neural language model** built from 
 │   ├── nn/
 │   │   └── LanguageModel.scala  # Model definition, forward/backward, parameter updates
 │   ├── train/
-│   │   ├── Trainer.scala        # Training loop with epoch metrics
+│   │   ├── Trainer.scala        # Training loop with early stopping, progress bar
 │   │   └── CheckpointIO.scala   # Model checkpoint save/load
 │   ├── eval/
 │   │   └── Metrics.scala        # Loss and perplexity calculation
 │   └── app/
-│       ├── Main.scala           # CLI entry point (train/predict/test)
-│       └── TestRunner.scala     # Built-in test suite (no test framework)
+│       ├── Main.scala           # CLI entry point (interactive train/predict)
+│       └── TestRunner.scala     # Built-in test suite
 ```
 
-## Building and Running
+## Usage
 
-### Compile
+### Training
+
+**Interactive (Recommended):**
 ```bash
-sbt compile
+sbt "runMain app.Main train"
 ```
 
-### Run All Tests
+Guides you through:
+1. Selecting training text file
+2. Choosing quality preset (Quick/Balanced/Thorough)
+3. Optional advanced options
+4. Confirming and starting training
+
+**Command-line:**
+```bash
+# Quick test
+sbt "runMain app.Main train --preset quick --input corpus.txt"
+
+# Standard
+sbt "runMain app.Main train --preset balanced --input corpus.txt"
+
+# Best quality
+sbt "runMain app.Main train --preset thorough --input corpus.txt"
+```
+
+### Prediction
+
+**Interactive:**
+```bash
+sbt "runMain app.Main predict"
+```
+
+**Command-line:**
+```bash
+sbt "runMain app.Main predict --context 'the cat sat' --topK 5"
+```
+
+### Testing
 ```bash
 sbt "runMain app.TestRunner"
 ```
 
-### Train a Model
-```bash
-sbt "runMain app.Main train --input data/2026-03-17/example-corpus.txt --model data/2026-03-17/model.ckpt --vocab data/2026-03-17/vocab.txt \
-  --contextSize 3 --embedDim 24 --hiddenDim 64 --maxVocab 3000 \
-  --epochs 10 --lr 0.05 --lrDecay 1.0 --l2 0.0 --clipNorm 1.0 \
-  --seed 42 --trainRatio 0.9"
-```
+## Training Presets
 
-### Predict Next Word
+| Preset | Epochs | Patience | Hidden | Embed | Time | Use Case |
+|--------|--------|----------|--------|-------|------|----------|
+| quick | 5 | 3 | 32 | 16 | ~30s | Testing |
+| balanced | 20 | 5 | 64 | 24 | ~2min | Default |
+| thorough | 50 | 10 | 128 | 48 | ~10min | Best quality |
 
-**Important:** Use single quotes around the full command and double quotes for the context string:
+## Key Concepts (Simple Explanations)
 
-```bash
-# Single word context
-sbt "runMain app.Main predict --model data/2026-03-17/model.ckpt --vocab data/2026-03-17/vocab.txt --context the --topK 5"
-
-# Multi-word context (note the quote style)
-sbt 'runMain app.Main predict --model data/2026-03-17/model.ckpt --vocab data/2026-03-17/vocab.txt --context "the cat" --topK 5'
-```
-
-### CLI Options
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--input` | (required) | Input text file for training |
-| `--model` | `model.ckpt` | Model checkpoint path |
-| `--vocab` | `vocab.txt` | Vocabulary file path |
-| `--contextSize` | `3` | Context window size |
-| `--embedDim` | `24` | Embedding dimension |
-| `--hiddenDim` | `64` | Hidden layer dimension |
-| `--maxVocab` | `3000` | Maximum vocabulary size |
-| `--epochs` | `10` | Number of training epochs |
-| `--lr` | `0.05` | Learning rate |
-| `--lrDecay` | `1.0` | Learning rate decay per epoch |
-| `--l2` | `0.0` | L2 regularization coefficient |
-| `--clipNorm` | (optional) | Gradient clipping threshold |
-| `--seed` | `42` | Random seed |
-| `--trainRatio` | `0.9` | Train/validation split ratio |
-| `--context` | (required) | Context text for prediction |
-| `--topK` | `5` | Number of top predictions to show |
+| Term | What It Means |
+|------|---------------|
+| **Model** | The "trained brain" - learned word patterns |
+| **Vocabulary** | List of words the model knows |
+| **Epoch** | One full pass through training data |
+| **Patience** | Stop if no improvement after N epochs (prevents overfitting) |
+| **Context Size** | How many previous words to look at |
+| **Embedding Dim** | How "rich" word representations are |
+| **Hidden Dim** | Model's "thinking power" |
 
 ## Key Implementation Details
 
@@ -117,13 +127,13 @@ sbt 'runMain app.Main predict --model data/2026-03-17/model.ckpt --vocab data/20
 - `Matrix`: Flat `Vector[Double]` storage with row/col metadata and transpose view
 - `Vec`: Type alias for `Vector[Double]`
 - Stable softmax using max-shift for numerical stability
-- Operations: `vecAdd`, `vecSub`, `scalarMul`, `dot`, `matVecMul`, `outer`, `tanhVec`
+- Operations: `vecAdd`, `vecSub`, `scalarMul`, `dot`, `matVecMul`, `outer`, `tanhVec`, `relu`, `reluGrad`
 
 ### Neural Network (`nn/`)
 - **Parameters**: `Params(E, W1, b1, W2, b2)` - Embedding, two weight matrices, two biases
 - **Forward**: Returns `ForwardCache` with intermediate values for backprop
 - **Backward**: Manual gradient computation with embedding gradient scatter accumulation
-- **Update**: SGD with optional L2 regularization and gradient clipping
+- **Activation**: Configurable (tanh or relu)
 
 ### Data Pipeline (`data/`)
 - Tokenization: Lowercase, split on non-alphanumeric
@@ -131,9 +141,14 @@ sbt 'runMain app.Main predict --model data/2026-03-17/model.ckpt --vocab data/20
 - Examples: Sliding window of context→target pairs
 - Split: Deterministic shuffle with seed
 
+### Training (`train/`)
+- SGD with optional gradient clipping and L2 regularization
+- **Early stopping**: Stops when validation loss stops improving
+- **Progress bar**: Shows ETA, throughput, and current loss
+
 ### Testing
-- Custom `TestRunner` with 7 milestone tests (no external test framework)
-- Tests cover: matrix ops, softmax stability, forward shapes, gradient accumulation, gradient checking, training regression, inference
+- Custom `TestRunner` with 13 tests (no external test framework)
+- Tests cover: matrix ops, softmax, forward shapes, gradient accumulation, gradient checking, ReLU, early stopping, training regression, inference
 
 ## Development Conventions
 
@@ -141,25 +156,49 @@ sbt 'runMain app.Main predict --model data/2026-03-17/model.ckpt --vocab data/20
 - **Functional style**: Immutable case classes, pure functions where possible
 - **Explicit types**: Full type annotations on public APIs
 - **Deterministic training**: Seed-based reproducibility for all random operations
-- **No test framework dependency**: Self-contained test runner for portability
+- **Interactive-first**: Default to user-friendly interactive mode
 
 ## File Formats
 
 ### Model Checkpoint (`*.ckpt`)
-Binary format containing model parameters and configuration.
+Text format containing:
+- Model configuration (contextSize, embedDim, hiddenDim, vocabSize)
+- All parameter matrices (E, W1, b1, W2, b2)
 
 ### Vocabulary (`*.txt`)
-Text file with token-to-id mappings.
+Plain text, one word per line:
+```
+<UNK>
+the
+and
+cat
+dog
+...
+```
+
+## Git Ignore Rules
+
+```
+# Keep example corpus
+!data/**/example-corpus.txt
+
+# Ignore generated files
+data/**/*.ckpt
+data/**/*.txt (except example-corpus.txt)
+```
 
 ## Troubleshooting
 
 ### Context not recognized (all `<UNK>` tokens)
-If you see `context_ids=[0,0,0]` in prediction output, the quote style is wrong. Use:
-- Single quotes around the full command: `'... --context "text" ...'`
-- Double quotes around the context value: `--context "the cat"`
+If you see `context_ids=[0,0,0]` in prediction output, the words aren't in the vocabulary. Use words from your training data.
 
 ### Model overfitting
 If validation loss increases while training loss decreases:
-- Add more training data to your corpus
-- Reduce model complexity (`--embedDim`, `--hiddenDim`)
-- Add regularization (`--l2 0.01 --clipNorm 1.0`)
+- The **early stopping** (patience) should catch this automatically
+- Or use a smaller preset (less epochs)
+- Or add more training data
+
+### Slow training
+- Use `--preset quick` for testing
+- Reduce model size (advanced: `--hiddenDim 32 --embedDim 16`)
+- This is CPU-only (no GPU acceleration)

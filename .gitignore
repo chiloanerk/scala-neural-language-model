@@ -11,10 +11,13 @@ project/project/
 # OS files
 .DS_Store
 
-# Data files (except example)
-data/**/*.ckpt
-data/**/*.txt
-!data/**/example-corpus.txt
+# Models (keep vocab, ignore checkpoints)
+data/models/*.ckpt
+data/models/*.vocab
+
+# Chunked files (can be regenerated)
+data/corpus/chunks/
+data/corpus/*/chunks/
 
 # Logs
 *.log

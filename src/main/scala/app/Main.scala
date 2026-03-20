@@ -7,99 +7,414 @@ import nn.{LanguageModel, ModelConfig}
 import train.{CheckpointIO, TrainConfig, Trainer}
 
 import java.nio.charset.StandardCharsets
-import java.nio.file.{Files, Path}
+import java.nio.file.{Files, Path, StandardOpenOption}
+import scala.io.StdIn
+import scala.jdk.CollectionConverters._
+import scala.util.Using
 
 object Main:
 
+  // Persistent model paths
+  val ModelPath = Path.of("data/models/latest.ckpt")
+  val VocabPath = Path.of("data/models/latest.vocab")
+
+  // Training presets
+  case class Preset(name: String, epochs: Int, patience: Int, hiddenDim: Int, embedDim: Int, description: String)
+
+  val presets = Vector(
+    Preset("quick", 5, 3, 32, 16, "Test (~30 sec)"),
+    Preset("balanced", 20, 5, 64, 24, "Standard (~2 min)"),
+    Preset("thorough", 50, 10, 128, 48, "Best quality (~10 min)")
+  )
+
   def main(args: Array[String]): Unit =
     if args.isEmpty then
-      printUsage()
-      sys.exit(1)
+      showMainMenu()
+      sys.exit(0)
 
     args(0) match
       case "train"   => runTrain(parseArgs(args.drop(1)))
       case "predict" => runPredict(parseArgs(args.drop(1)))
+      case "chunk"   => runChunker(parseArgs(args.drop(1)))
       case "test"    => TestRunner.main(Array.empty)
       case _ =>
         printUsage()
         sys.exit(1)
 
+  private def showMainMenu(): Unit =
+    val modelStatus = if Files.isRegularFile(ModelPath) then
+      val size = Files.size(ModelPath) / 1024
+      s"✓ Model exists (${size} KB)"
+    else "✗ No model yet"
+
+    println(
+      s"""
+      |=== Neural Language Model ===
+      |
+      |Status: $modelStatus
+      |
+      |Commands:
+      |  train   - Train or continue training your model
+      |  predict - Predict next words
+      |  chunk   - Split large files into training chunks
+      |  test    - Run built-in tests
+      |
+      |Quick start:
+      |  sbt "runMain app.Main train --input data/corpus/text.txt"
+      |  sbt "runMain app.Main predict --context 'the cat'"
+      |  sbt "runMain app.Main chunk --input large-file.txt --lines 1000"
+      |""".stripMargin)
+
   private def runTrain(flags: Map[String, String]): Unit =
-    val inputPath = Path.of(required(flags, "input"))
-    val modelPath = Path.of(flags.getOrElse("model", "model.ckpt"))
-    val vocabPath = Path.of(flags.getOrElse("vocab", "vocab.txt"))
+    println("\n=== Training ===\n")
 
-    val contextSize = flags.get("contextSize").map(_.toInt).getOrElse(3)
-    val embedDim = flags.get("embedDim").map(_.toInt).getOrElse(24)
-    val hiddenDim = flags.get("hiddenDim").map(_.toInt).getOrElse(64)
-    val maxVocab = flags.get("maxVocab").map(_.toInt).getOrElse(3000)
-    val epochs = flags.get("epochs").map(_.toInt).getOrElse(10)
-    val lr = flags.get("lr").map(_.toDouble).getOrElse(0.05)
-    val lrDecay = flags.get("lrDecay").map(_.toDouble).getOrElse(1.0)
-    val l2 = flags.get("l2").map(_.toDouble).getOrElse(0.0)
-    val clipNorm = flags.get("clipNorm").map(_.toDouble)
-    val seed = flags.get("seed").map(_.toInt).getOrElse(42)
-    val trainRatio = flags.get("trainRatio").map(_.toDouble).getOrElse(0.9)
+    // Check for existing model
+    val freshTraining = flags.get("fresh").exists(v => v == "true" || v == "1")
+    val hasExistingModel = Files.isRegularFile(ModelPath)
 
+    if hasExistingModel && !freshTraining then
+      val size = Files.size(ModelPath) / 1024
+      println(s"Found existing model: $ModelPath (${size} KB)")
+      println("This will continue training from where you left off.\n")
+    else if freshTraining then
+      println("Starting fresh training (ignoring any existing model).\n")
+    else
+      println("No existing model found. Starting fresh training.\n")
+
+    // Get input file
+    val inputPath = flags.get("input") match
+      case Some(path) => Path.of(path)
+      case None =>
+        // Discover text files
+        val candidates = discoverTextFiles(Path.of(".").toAbsolutePath.normalize, maxDepth = 6)
+          .filter(p => !p.toString.contains("/chunks/")) // Skip chunked files
+        if candidates.isEmpty then
+          println("Error: No .txt files found. Specify --input <file.txt>")
+          sys.exit(1)
+        
+        println("Found text files (excluding chunks):")
+        candidates.zipWithIndex.foreach { case (p, idx) =>
+          val lines = countLines(p)
+          val size = Files.size(p) / 1024
+          println(s"  ${idx + 1}. $p (${lines} lines, ${size} KB)")
+        }
+        println()
+        
+        var selected: Option[Path] = None
+        while selected.isEmpty do
+          val raw = StdIn.readLine(s"Choose file number [1]: ").trim
+          val idx = if raw.isEmpty then 0 else raw.toIntOption.getOrElse(1) - 1
+          if idx >= 0 && idx < candidates.length then selected = Some(candidates(idx))
+          else println(s"Please choose 1-${candidates.length}.")
+        selected.get
+
+    require(Files.isRegularFile(inputPath), s"Input file not found: $inputPath")
+
+    // Check if we can reuse existing model's architecture
+    val existingCfg = if hasExistingModel && !freshTraining && Files.isRegularFile(ModelPath) then
+      Some(CheckpointIO.load(ModelPath)._2)
+    else
+      None
+
+    // Get preset
+    val presetName = flags.get("preset").getOrElse {
+      println("\nChoose training quality:")
+      presets.zipWithIndex.foreach { case (p, idx) =>
+        println(s"  ${idx + 1}. ${p.name.capitalize} - ${p.description}")
+      }
+      val raw = StdIn.readLine("\nSelect preset [2]: ").trim
+      val idx = if raw.isEmpty then 1 else raw.toIntOption.getOrElse(2) - 1
+      if idx >= 0 && idx < presets.length then presets(idx).name else "balanced"
+    }
+    val preset = presets.find(_.name == presetName).getOrElse {
+      println(s"Unknown preset '$presetName'. Using 'balanced'.")
+      presets(1)
+    }
+
+    // Get advanced options - use existing model's architecture if available
+    val contextSize = flags.get("contextSize").map(_.toInt).getOrElse {
+      existingCfg match
+        case Some(cfg) =>
+          println(s"\nUsing existing model architecture: context=${cfg.contextSize}")
+          cfg.contextSize
+        case None =>
+          val raw = StdIn.readLine("\nContext size (words to look back) [3]: ").trim
+          raw.toIntOption.getOrElse(3)
+    }
+    val maxVocab = flags.get("maxVocab").map(_.toInt).getOrElse {
+      existingCfg match
+        case Some(cfg) =>
+          println(s"Using existing model vocabulary size: ${cfg.vocabSize}")
+          cfg.vocabSize
+        case None =>
+          val raw = StdIn.readLine("Max vocabulary (unique words) [3000]: ").trim
+          raw.toIntOption.getOrElse(3000)
+    }
+
+    // Ensure output directory exists
+    Files.createDirectories(ModelPath.getParent)
+
+    // Show summary and confirm
+    println(s"\n=== Summary ===")
+    println(s"  Input: $inputPath")
+    println(s"  Preset: ${preset.name.capitalize} (${preset.epochs} epochs, patience=${preset.patience})")
+    println(s"  Context size: $contextSize")
+    println(s"  Max vocab: $maxVocab")
+    if existingCfg.isDefined then
+      println(s"  ✓ Continuing from existing model")
+    else
+      println(s"  🆕 Starting fresh model")
+    println()
+
+    val autoConfirm = flags.get("yes").exists(v => v == "true" || v == "1" || v == "y")
+    val confirm = if autoConfirm then
+      println("Auto-confirming (--yes flag)")
+      true
+    else
+      promptYesNo("Start training?", true)
+    
+    if !confirm then
+      println("Training canceled.")
+      sys.exit(0)
+
+    println()
+
+    // Load or create model
     val rawText = Files.readString(inputPath, StandardCharsets.UTF_8)
     val tokens = TextPipeline.tokenize(rawText)
-    val vocab = TextPipeline.buildVocab(tokens, maxVocab)
+    
+    val vocab = if freshTraining || !Files.isRegularFile(VocabPath) then
+      TextPipeline.buildVocab(tokens, maxVocab)
+    else
+      VocabIO.load(VocabPath)
+
     val ids = TextPipeline.tokensToIds(tokens, vocab)
     val examples = TextPipeline.buildExamples(ids, contextSize)
-    val (trainSet, valSet) = TextPipeline.splitDeterministic(examples, trainRatio, seed)
+    val (trainSet, valSet) = TextPipeline.splitDeterministic(examples, 0.9, 42)
 
     require(trainSet.nonEmpty, "Training set is empty. Provide more text or reduce contextSize.")
 
-    val cfg = ModelConfig(contextSize = contextSize, embedDim = embedDim, hiddenDim = hiddenDim, vocabSize = vocab.size)
-    val params0 = LanguageModel.initParams(cfg, seed)
-
-    val trainCfg = TrainConfig(
-      epochs = epochs,
-      learningRate = lr,
-      lrDecay = lrDecay,
-      l2 = l2,
-      clipNorm = clipNorm,
-      shuffleEachEpoch = true,
-      seed = seed
+    val cfg = ModelConfig(
+      contextSize = contextSize,
+      embedDim = preset.embedDim,
+      hiddenDim = preset.hiddenDim,
+      vocabSize = vocab.size,
+      activation = "tanh"
     )
 
+    val params0 = if hasExistingModel && !freshTraining && Files.isRegularFile(ModelPath) then
+      val (existingParams, existingCfg) = CheckpointIO.load(ModelPath)
+      println(s"Loaded existing model (vocab: ${existingCfg.vocabSize} words, context: ${existingCfg.contextSize}, embed: ${existingCfg.embedDim}, hidden: ${existingCfg.hiddenDim})")
+      existingParams
+    else
+      println("Initializing new model...")
+      LanguageModel.initParams(cfg, 42)
+
+    val trainCfg = TrainConfig(
+      epochs = preset.epochs,
+      learningRate = 0.05,
+      lrDecay = 1.0,
+      l2 = 0.0,
+      clipNorm = None,
+      shuffleEachEpoch = true,
+      seed = 42,
+      patience = preset.patience,
+      activation = "tanh"
+    )
+
+    // Train
     val result = Trainer.train(params0, trainSet, valSet, trainCfg)
+
+    // Save
+    CheckpointIO.save(result.params, cfg, ModelPath)
+    VocabIO.save(vocab, VocabPath)
+
+    println("\n=== Results ===")
     result.history.foreach { m =>
-      println(f"epoch=${m.epoch}%d lr=${m.learningRate}%.5f train_loss=${m.trainLoss}%.6f val_loss=${m.valLoss}%.6f val_ppl=${m.valPerplexity}%.4f")
+      val indicator = if m.valLoss == result.history.map(_.valLoss).min then " ← best" else ""
+      println(f"  Epoch ${m.epoch}%2d: train=${m.trainLoss}%.4f val=${m.valLoss}%.4f ppl=${m.valPerplexity}%.1f$indicator")
     }
 
-    CheckpointIO.save(result.params, cfg, modelPath)
-    VocabIO.save(vocab, vocabPath)
+    println(s"\n✓ Model saved to $ModelPath")
+    println(s"  Vocab saved to $VocabPath")
+    println(s"  Final: val_loss=${result.history.last.valLoss}%.4f val_ppl=${result.history.last.valPerplexity}%.1f")
+    println()
+    println("Continue with: sbt \"runMain app.Main train --input <more-data.txt>\"")
+    println("Or predict:    sbt \"runMain app.Main predict --context 'your text'\"")
 
-    val finalValLoss = Metrics.meanLoss(result.params, valSet)
-    val finalPpl = Metrics.perplexity(finalValLoss)
-    println(f"saved model=${modelPath.toString} vocab=${vocabPath.toString} final_val_loss=${finalValLoss}%.6f final_val_ppl=${finalPpl}%.4f")
+  private def runChunker(flags: Map[String, String]): Unit =
+    println("\n=== File Chunker ===\n")
+
+    // Get input file
+    val inputPath = flags.get("input") match
+      case Some(path) => Path.of(path)
+      case None =>
+        // Discover text files
+        val candidates = discoverTextFiles(Path.of(".").toAbsolutePath.normalize, maxDepth = 6)
+        if candidates.isEmpty then
+          println("No .txt files found. Specify --input <file.txt>")
+          sys.exit(1)
+        
+        println("Found text files:")
+        candidates.zipWithIndex.foreach { case (p, idx) =>
+          val lines = countLines(p)
+          val size = Files.size(p) / 1024
+          println(s"  ${idx + 1}. $p (${lines} lines, ${size} KB)")
+        }
+        println()
+        
+        var selected: Option[Path] = None
+        while selected.isEmpty do
+          val raw = StdIn.readLine("Choose file number: ").trim
+          val idx = raw.toIntOption.getOrElse(1) - 1
+          if idx >= 0 && idx < candidates.length then selected = Some(candidates(idx))
+          else println(s"Please choose 1-${candidates.length}.")
+        selected.get
+
+    require(Files.isRegularFile(inputPath), s"Input file not found: $inputPath")
+    
+    val totalLines = countLines(inputPath)
+    val sizeKB = Files.size(inputPath) / 1024
+    println(s"\nSelected: $inputPath")
+    println(s"Size: ${totalLines} lines, ${sizeKB} KB\n")
+
+    // Get chunk size
+    val chunkSize = flags.get("lines").map(_.toInt).getOrElse {
+      // Recommend based on file size
+      val recommended = if totalLines > 10000 then 2000
+                        else if totalLines > 5000 then 1000
+                        else 500
+      println(s"Recommended chunk size: $recommended lines")
+      println(s"  - This will create ${(totalLines + recommended - 1) / recommended} chunks\n")
+      
+      var size: Option[Int] = None
+      while size.isEmpty do
+        val raw = StdIn.readLine(s"Lines per chunk [$recommended]: ").trim
+        size = if raw.isEmpty then Some(recommended) else raw.toIntOption
+        if size.isEmpty then println("Please enter a number.")
+      size.get
+    }
+
+    // Get output directory
+    val outputDir = flags.get("output") match
+      case Some(path) => Path.of(path)
+      case None =>
+        val parent = Option(inputPath.getParent).getOrElse(Path.of("."))
+        parent.resolve("chunks")
+
+    Files.createDirectories(outputDir)
+
+    // Get base name for chunks
+    val baseName = flags.get("name").getOrElse {
+      inputPath.getFileName.toString.replace(".txt", "")
+    }
+
+    println(s"\nChunking plan:")
+    println(s"  Input: $inputPath (${totalLines} lines)")
+    println(s"  Output: $outputDir/")
+    println(s"  Chunk size: $chunkSize lines")
+    val autoConfirm = flags.get("yes").exists(v => v == "true" || v == "1" || v == "y")
+    
+    println(s"  Files: ${baseName}-part1.txt, ${baseName}-part2.txt, ...")
+    println()
+
+    val confirm = if autoConfirm then
+      println("Auto-confirming (--yes flag)")
+      true
+    else
+      promptYesNo("Create chunks?", true)
+      
+    if !confirm then
+      println("Canceled.")
+      sys.exit(0)
+
+    // Read and split
+    val lines = Files.readAllLines(inputPath, StandardCharsets.UTF_8)
+    val totalChunks = (lines.size() + chunkSize - 1) / chunkSize
+
+    println(s"\nCreating $totalChunks chunks...")
+
+    var chunkNum = 1
+    var lineIdx = 0
+    while lineIdx < lines.size() do
+      val endIdx = math.min(lineIdx + chunkSize, lines.size())
+      val chunkLines = lines.subList(lineIdx, endIdx)
+      
+      val chunkPath = outputDir.resolve(s"${baseName}-part$chunkNum.txt")
+      Files.write(chunkPath, chunkLines, StandardCharsets.UTF_8)
+      
+      val chunkLinesCount = endIdx - lineIdx
+      println(s"  ✓ ${chunkPath.getFileName} ($chunkLinesCount lines)")
+      
+      chunkNum += 1
+      lineIdx = endIdx
+
+    println(s"\n✓ Created $totalChunks chunks in $outputDir/")
+    println()
+    println("Next steps:")
+    println(s"  sbt \"runMain app.Main train --input $outputDir/${baseName}-part1.txt --preset quick\"")
+    println(s"  sbt \"runMain app.Main train --input $outputDir/${baseName}-part2.txt --preset quick\"")
+    println("  ... continue with remaining parts")
 
   private def runPredict(flags: Map[String, String]): Unit =
-    val modelPath = Path.of(required(flags, "model"))
-    val vocabPath = Path.of(required(flags, "vocab"))
-    val contextText = required(flags, "context")
+    println("\n=== Prediction ===\n")
+
+    // Check model exists
+    if !Files.isRegularFile(ModelPath) then
+      println("No model found. Train first:")
+      println("  sbt \"runMain app.Main train --input data/corpus/text.txt\"")
+      sys.exit(1)
+
+    val (params, cfg) = CheckpointIO.load(ModelPath)
+    val vocab = VocabIO.load(VocabPath)
+
+    println(s"Model: ${vocab.size} words, context=${cfg.contextSize}")
+    println()
+
+    // Get context
+    val contextText = flags.get("context") match
+      case Some(text) => text
+      case None =>
+        println("Enter text to predict next word (or 'quit'):")
+        val raw = StdIn.readLine("> ")
+        if raw == null || raw.trim.toLowerCase == "quit" then sys.exit(0)
+        raw.trim
+
     val topK = flags.get("topK").map(_.toInt).getOrElse(5)
 
-    val (params, cfg) = CheckpointIO.load(modelPath)
-    val vocab = VocabIO.load(vocabPath)
-
-    require(vocab.size == cfg.vocabSize, s"vocab size ${vocab.size} does not match model vocab size ${cfg.vocabSize}")
-
-    val contextTokens = TextPipeline.tokenize(contextText)
-    val contextIds = adaptContext(contextTokens.map(vocab.toId), cfg.contextSize, vocab.unkId)
+    val tokens = TextPipeline.tokenize(contextText)
+    val contextIds = adaptContext(tokens.map(vocab.toId), cfg.contextSize, vocab.unkId)
 
     val cache = LanguageModel.forward(params, contextIds)
     val top = LinearAlgebra.argTopK(cache.probs, topK)
 
-    println(s"context_ids=${contextIds.mkString("[", ",", "]")}")
-    top.foreach { case (id, prob) =>
-      println(f"${vocab.toToken(id)}%-20s id=${id}%d prob=${prob}%.6f")
+    println("\nTop predictions:")
+    top.zipWithIndex.foreach { case ((id, prob), idx) =>
+      val word = vocab.toToken(id)
+      val bar = "█" * ((prob * 20).toInt max 1)
+      println(f"  ${idx + 1}. $word%-12s $bar%-20s ${prob * 100}%.1f%%")
     }
 
   private def adaptContext(ids: Vector[Int], contextSize: Int, padId: Int): Vector[Int] =
     if ids.length >= contextSize then ids.takeRight(contextSize)
     else Vector.fill(contextSize - ids.length)(padId) ++ ids
+
+  private def countLines(path: Path): Int =
+    Using.resource(Files.lines(path)) { lines =>
+      lines.count().toInt
+    }
+
+  private def discoverTextFiles(root: Path, maxDepth: Int = 6, maxResults: Int = 20): Vector[Path] =
+    if !Files.exists(root) then Vector.empty
+    else
+      Using.resource(Files.walk(root, maxDepth)) { stream =>
+        stream.iterator().asScala
+          .filter(Files.isRegularFile(_))
+          .filter(p => p.getFileName.toString.toLowerCase.endsWith(".txt"))
+          .toVector
+          .sortBy(_.toString)
+          .take(maxResults)
+      }
 
   private def parseArgs(args: Array[String]): Map[String, String] =
     args.toVector
@@ -109,14 +424,44 @@ object Main:
       }
       .toMap
 
-  private def required(flags: Map[String, String], key: String): String =
-    flags.getOrElse(key, throw new IllegalArgumentException(s"Missing required --$key"))
+  private def promptYesNo(label: String, default: Boolean): Boolean =
+    val defaultStr = if default then "Y/n" else "y/N"
+    val raw = StdIn.readLine(s"$label [$defaultStr]: ")
+    if raw == null || raw.trim.isEmpty then default
+    else raw.trim.toLowerCase match
+      case "y" | "yes" | "1" | "true" => true
+      case "n" | "no" | "0" | "false" => false
+      case _ => default
 
   private def printUsage(): Unit =
     println(
       """Usage:
-        |  sbt \"run train --input <text.txt> [--model model.ckpt] [--vocab vocab.txt] [--contextSize 3] [--embedDim 24] [--hiddenDim 64] [--maxVocab 3000] [--epochs 10] [--lr 0.05] [--lrDecay 1.0] [--l2 0.0] [--clipNorm 1.0] [--seed 42] [--trainRatio 0.9]\"
-        |  sbt \"run predict --model <model.ckpt> --vocab <vocab.txt> --context 'your context words' [--topK 5]\"
-        |  sbt \"run test\"
-        |""".stripMargin
-    )
+        |
+        |  sbt "runMain app.Main"              Show this menu
+        |  sbt "runMain app.Main train"        Train/continue training
+        |  sbt "runMain app.Main predict"      Predict next words
+        |  sbt "runMain app.Main chunk"        Split large files into chunks
+        |
+        |Training:
+        |  --input FILE      Training text file (required)
+        |  --preset NAME     quick/balanced/thorough (default: balanced)
+        |  --fresh           Start fresh (ignore existing model)
+        |  --contextSize N   Words to look back (default: 3)
+        |  --maxVocab N      Max unique words (default: 3000)
+        |
+        |Chunking:
+        |  --input FILE      File to split (required, or select interactively)
+        |  --lines N         Lines per chunk (default: auto-recommend)
+        |  --output DIR      Output directory (default: <input>/chunks/)
+        |  --name BASE       Base name for chunks (default: input filename)
+        |
+        |Prediction:
+        |  --context TEXT    Words to continue from
+        |  --topK N          Predictions to show (default: 5)
+        |
+        |Examples:
+        |  sbt "runMain app.Main train --input data/corpus/text.txt"
+        |  sbt "runMain app.Main train --input more.txt --preset quick"
+        |  sbt "runMain app.Main chunk --input large-file.txt --lines 1000"
+        |  sbt "runMain app.Main predict --context 'the cat sat' --topK 5"
+        |""".stripMargin)

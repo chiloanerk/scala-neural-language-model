@@ -7,8 +7,9 @@ import scala.util.Random
 final case class Params(E: Matrix, W1: Matrix, b1: Vec, W2: Matrix, b2: Vec)
 final case class Grads(dE: Matrix, dW1: Matrix, db1: Vec, dW2: Matrix, db2: Vec)
 final case class ForwardCache(x: Vec, z1: Vec, a1: Vec, logits: Vec, probs: Vec, context: Vector[Int])
+final case class ActivationCache(z1: Vec, a1: Vec)
 
-final case class ModelConfig(contextSize: Int, embedDim: Int, hiddenDim: Int, vocabSize: Int)
+final case class ModelConfig(contextSize: Int, embedDim: Int, hiddenDim: Int, vocabSize: Int, activation: String = "tanh")
 
 object LanguageModel:
 
@@ -27,21 +28,27 @@ object LanguageModel:
     val bound = math.sqrt(6.0) / math.sqrt(fanIn.toDouble + fanOut.toDouble)
     Matrix.fromFunction(fanOut, fanIn)((_, _) => rnd.between(-bound, bound))
 
-  def forward(p: Params, context: Vector[Int]): ForwardCache =
+  def forward(p: Params, context: Vector[Int], activation: String = "tanh"): ForwardCache =
     require(context.nonEmpty, "context cannot be empty")
 
     val x = context.flatMap(id => p.E.rowSlice(id))
     val z1 = LinearAlgebra.vecAdd(LinearAlgebra.matVecMul(p.W1, x), p.b1)
-    val a1 = LinearAlgebra.tanhVec(z1)
+    val a1 = applyActivation(z1, activation)
     val logits = LinearAlgebra.vecAdd(LinearAlgebra.matVecMul(p.W2, a1), p.b2)
     val probs = LinearAlgebra.softmaxStable(logits)
 
     ForwardCache(x = x, z1 = z1, a1 = a1, logits = logits, probs = probs, context = context)
 
+  private def applyActivation(v: Vec, activation: String): Vec =
+    activation.toLowerCase match
+      case "relu" => LinearAlgebra.relu(v)
+      case "tanh" => LinearAlgebra.tanhVec(v)
+      case _      => throw new IllegalArgumentException(s"Unknown activation: $activation. Use 'relu' or 'tanh'.")
+
   def lossFromCache(cache: ForwardCache, target: Int): Double =
     LinearAlgebra.crossEntropy(cache.probs, target)
 
-  def backward(p: Params, cache: ForwardCache, target: Int): Grads =
+  def backward(p: Params, cache: ForwardCache, target: Int, activation: String = "tanh"): Grads =
     val vocabSize = cache.probs.length
     require(target >= 0 && target < vocabSize, s"target out of range: $target")
 
@@ -55,10 +62,7 @@ object LanguageModel:
 
     val da1 = LinearAlgebra.matVecMul(p.W2.transposeView, dLogits)
 
-    val dz1 = da1.indices.map { i =>
-      val tanhVal = math.tanh(cache.z1(i))
-      da1(i) * (1.0 - tanhVal * tanhVal)
-    }.toVector
+    val dz1 = applyActivationGrad(da1, cache.z1, activation)
 
     val dW1 = LinearAlgebra.outer(dz1, cache.x)
     val db1 = dz1
@@ -68,6 +72,12 @@ object LanguageModel:
     val dE = scatterEmbeddingGrad(dx, cache.context, p.E.rows, p.E.cols)
 
     Grads(dE = dE, dW1 = dW1, db1 = db1, dW2 = dW2, db2 = db2)
+
+  private def applyActivationGrad(grad: Vec, z: Vec, activation: String): Vec =
+    activation.toLowerCase match
+      case "relu" => LinearAlgebra.hadamard(grad, LinearAlgebra.reluGrad(z))
+      case "tanh" => LinearAlgebra.hadamard(grad, LinearAlgebra.tanhGrad(z))
+      case _      => throw new IllegalArgumentException(s"Unknown activation: $activation. Use 'relu' or 'tanh'.")
 
   private def scatterEmbeddingGrad(dx: Vec, context: Vector[Int], vocabSize: Int, embedDim: Int): Matrix =
     require(dx.length == context.length * embedDim, s"dx length ${dx.length} must equal contextSize*embedDim ${context.length * embedDim}")
@@ -149,9 +159,9 @@ object LanguageModel:
         db2 = scaleVec(g.db2)
       )
 
-  def trainStep(p: Params, ex: Example, lr: Double, l2: Double = 0.0, clipNorm: Option[Double] = None): (Params, Double) =
-    val cache = forward(p, ex.context)
+  def trainStep(p: Params, ex: Example, lr: Double, l2: Double = 0.0, clipNorm: Option[Double] = None, activation: String = "tanh"): (Params, Double) =
+    val cache = forward(p, ex.context, activation)
     val loss = lossFromCache(cache, ex.target)
-    val grads = backward(p, cache, ex.target)
+    val grads = backward(p, cache, ex.target, activation)
     val updated = update(p, grads, lr, l2 = l2, clipNorm = clipNorm)
     (updated, loss)
