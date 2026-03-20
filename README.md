@@ -28,6 +28,12 @@ sbt "runMain app.Main predict --context 'the cat sat'"
 sbt "runMain app.Main chunk --input large-file.txt --lines 1000 --yes"
 ```
 
+### 5. Run Full Automated Test Suite
+
+```bash
+sbt test
+```
+
 ## How It Works
 
 **One persistent model** at `data/models/latest.ckpt` that gets smarter over time:

@@ -69,17 +69,30 @@ object Main:
     println("\n=== Training ===\n")
 
     // Check for existing model
-    val freshTraining = flags.get("fresh").exists(v => v == "true" || v == "1")
+    val freshTraining = flags.get("fresh").exists(CliHelpers.isTruthy)
     val hasExistingModel = Files.isRegularFile(ModelPath)
 
-    if hasExistingModel && !freshTraining then
+    // Ask if user wants fresh start when model exists AND no flag provided
+    val actuallyFresh = if hasExistingModel && !freshTraining && !flags.contains("input") then
+      println(s"Found existing model: $ModelPath (${Files.size(ModelPath) / 1024} KB)")
+      println()
+      println("Choose action:")
+      println("  1. Continue training (default)")
+      println("  2. Start fresh (new model, ignores existing)")
+      println()
+      val raw = StdIn.readLine("Select [1]: ").trim
+      CliHelpers.parseMenuChoice(raw, optionCount = 2, defaultIndex = 0).contains(1)
+    else if freshTraining then
+      println("Starting fresh training (ignoring any existing model).\n")
+      true
+    else if hasExistingModel then
       val size = Files.size(ModelPath) / 1024
       println(s"Found existing model: $ModelPath (${size} KB)")
       println("This will continue training from where you left off.\n")
-    else if freshTraining then
-      println("Starting fresh training (ignoring any existing model).\n")
+      false
     else
       println("No existing model found. Starting fresh training.\n")
+      false
 
     // Get input file
     val inputPath = flags.get("input") match
@@ -88,30 +101,49 @@ object Main:
         // Discover text files
         val candidates = discoverTextFiles(Path.of(".").toAbsolutePath.normalize, maxDepth = 6)
           .filter(p => !p.toString.contains("/chunks/")) // Skip chunked files
-        if candidates.isEmpty then
-          println("Error: No .txt files found. Specify --input <file.txt>")
-          sys.exit(1)
         
-        println("Found text files (excluding chunks):")
-        candidates.zipWithIndex.foreach { case (p, idx) =>
+        // Count lines for each file (with fallback for encoding issues)
+        val candidatesWithLines = candidates.map { p =>
           val lines = countLines(p)
           val size = Files.size(p) / 1024
-          println(s"  ${idx + 1}. $p (${lines} lines, ${size} KB)")
+          (p, lines, size)
+        }.filter { case (_, lines, size) => lines > 0 || size > 0 } // Keep files with lines OR size > 0
+        
+        if candidatesWithLines.isEmpty then
+          println("Error: No readable .txt files found. Specify --input <file.txt>")
+          sys.exit(1)
+        
+        val (recommended, other) = CliHelpers.classifyTrainingFiles(candidatesWithLines.map(_._1))
+        val orderedPaths = recommended ++ other
+        val byPath = candidatesWithLines.map { case (p, lines, size) => p -> (lines, size) }.toMap
+
+        println("Found text files (excluding chunks):")
+        if recommended.nonEmpty then println("  Recommended training files:")
+        recommended.zipWithIndex.foreach { case (p, idx) =>
+          val (lines, size) = byPath(p)
+          val linesStr = if lines > 0 then s"$lines lines" else "unknown lines"
+          println(s"    ${idx + 1}. $p ($linesStr, ${size} KB)")
+        }
+        if other.nonEmpty then println("  Other text files (likely derived; usually avoid):")
+        other.zipWithIndex.foreach { case (p, idx) =>
+          val (lines, size) = byPath(p)
+          val linesStr = if lines > 0 then s"$lines lines" else "unknown lines"
+          println(s"    ${recommended.length + idx + 1}. $p ($linesStr, ${size} KB)")
         }
         println()
         
         var selected: Option[Path] = None
         while selected.isEmpty do
           val raw = StdIn.readLine(s"Choose file number [1]: ").trim
-          val idx = if raw.isEmpty then 0 else raw.toIntOption.getOrElse(1) - 1
-          if idx >= 0 && idx < candidates.length then selected = Some(candidates(idx))
-          else println(s"Please choose 1-${candidates.length}.")
+          CliHelpers.parseMenuChoice(raw, optionCount = orderedPaths.length, defaultIndex = 0) match
+            case Some(idx) => selected = Some(orderedPaths(idx))
+            case None      => println(s"Please choose 1-${orderedPaths.length}.")
         selected.get
 
     require(Files.isRegularFile(inputPath), s"Input file not found: $inputPath")
 
     // Check if we can reuse existing model's architecture
-    val existingCfg = if hasExistingModel && !freshTraining && Files.isRegularFile(ModelPath) then
+    val existingCfg = if hasExistingModel && !actuallyFresh && Files.isRegularFile(ModelPath) then
       Some(CheckpointIO.load(ModelPath)._2)
     else
       None
@@ -123,8 +155,8 @@ object Main:
         println(s"  ${idx + 1}. ${p.name.capitalize} - ${p.description}")
       }
       val raw = StdIn.readLine("\nSelect preset [2]: ").trim
-      val idx = if raw.isEmpty then 1 else raw.toIntOption.getOrElse(2) - 1
-      if idx >= 0 && idx < presets.length then presets(idx).name else "balanced"
+      val idx = CliHelpers.parseMenuChoice(raw, optionCount = presets.length, defaultIndex = 1).getOrElse(1)
+      presets(idx).name
     }
     val preset = presets.find(_.name == presetName).getOrElse {
       println(s"Unknown preset '$presetName'. Using 'balanced'.")
@@ -160,13 +192,15 @@ object Main:
     println(s"  Preset: ${preset.name.capitalize} (${preset.epochs} epochs, patience=${preset.patience})")
     println(s"  Context size: $contextSize")
     println(s"  Max vocab: $maxVocab")
-    if existingCfg.isDefined then
+    if actuallyFresh then
+      println(s"  🆕 Starting fresh model (new architecture)")
+    else if existingCfg.isDefined then
       println(s"  ✓ Continuing from existing model")
     else
       println(s"  🆕 Starting fresh model")
     println()
 
-    val autoConfirm = flags.get("yes").exists(v => v == "true" || v == "1" || v == "y")
+    val autoConfirm = flags.get("yes").exists(CliHelpers.isTruthy)
     val confirm = if autoConfirm then
       println("Auto-confirming (--yes flag)")
       true
@@ -179,11 +213,28 @@ object Main:
 
     println()
 
-    // Load or create model
-    val rawText = Files.readString(inputPath, StandardCharsets.UTF_8)
+    // Load or create model - try multiple encodings
+    val rawText = 
+      try
+        Files.readString(inputPath, StandardCharsets.UTF_8)
+      catch
+        case _: Exception =>
+          println("UTF-8 read failed, trying with system default encoding...")
+          // Use BufferedReader with default charset which is more lenient
+          import java.io._
+          val reader = new BufferedReader(new InputStreamReader(Files.newInputStream(inputPath)))
+          try
+            val text = new StringBuilder
+            var line = reader.readLine()
+            while line != null do
+              text.append(line).append("\n")
+              line = reader.readLine()
+            text.toString
+          finally
+            reader.close()
     val tokens = TextPipeline.tokenize(rawText)
     
-    val vocab = if freshTraining || !Files.isRegularFile(VocabPath) then
+    val vocab = if actuallyFresh || !Files.isRegularFile(VocabPath) then
       TextPipeline.buildVocab(tokens, maxVocab)
     else
       VocabIO.load(VocabPath)
@@ -202,7 +253,7 @@ object Main:
       activation = "tanh"
     )
 
-    val params0 = if hasExistingModel && !freshTraining && Files.isRegularFile(ModelPath) then
+    val params0 = if hasExistingModel && !actuallyFresh && Files.isRegularFile(ModelPath) then
       val (existingParams, existingCfg) = CheckpointIO.load(ModelPath)
       println(s"Loaded existing model (vocab: ${existingCfg.vocabSize} words, context: ${existingCfg.contextSize}, embed: ${existingCfg.embedDim}, hidden: ${existingCfg.hiddenDim})")
       existingParams
@@ -266,9 +317,9 @@ object Main:
         var selected: Option[Path] = None
         while selected.isEmpty do
           val raw = StdIn.readLine("Choose file number: ").trim
-          val idx = raw.toIntOption.getOrElse(1) - 1
-          if idx >= 0 && idx < candidates.length then selected = Some(candidates(idx))
-          else println(s"Please choose 1-${candidates.length}.")
+          CliHelpers.parseMenuChoice(raw, optionCount = candidates.length, defaultIndex = 0) match
+            case Some(idx) => selected = Some(candidates(idx))
+            case None      => println(s"Please choose 1-${candidates.length}.")
         selected.get
 
     require(Files.isRegularFile(inputPath), s"Input file not found: $inputPath")
@@ -281,9 +332,7 @@ object Main:
     // Get chunk size
     val chunkSize = flags.get("lines").map(_.toInt).getOrElse {
       // Recommend based on file size
-      val recommended = if totalLines > 10000 then 2000
-                        else if totalLines > 5000 then 1000
-                        else 500
+      val recommended = CliHelpers.recommendChunkSize(totalLines)
       println(s"Recommended chunk size: $recommended lines")
       println(s"  - This will create ${(totalLines + recommended - 1) / recommended} chunks\n")
       
@@ -313,7 +362,7 @@ object Main:
     println(s"  Input: $inputPath (${totalLines} lines)")
     println(s"  Output: $outputDir/")
     println(s"  Chunk size: $chunkSize lines")
-    val autoConfirm = flags.get("yes").exists(v => v == "true" || v == "1" || v == "y")
+    val autoConfirm = flags.get("yes").exists(CliHelpers.isTruthy)
     
     println(s"  Files: ${baseName}-part1.txt, ${baseName}-part2.txt, ...")
     println()
@@ -380,7 +429,7 @@ object Main:
         if raw == null || raw.trim.toLowerCase == "quit" then sys.exit(0)
         raw.trim
 
-    val topK = flags.get("topK").map(_.toInt).getOrElse(5)
+    val topK = CliHelpers.boundedTopK(flags.get("topK").flatMap(_.toIntOption).getOrElse(5))
 
     val tokens = TextPipeline.tokenize(contextText)
     val contextIds = adaptContext(tokens.map(vocab.toId), cfg.contextSize, vocab.unkId)
@@ -400,9 +449,17 @@ object Main:
     else Vector.fill(contextSize - ids.length)(padId) ++ ids
 
   private def countLines(path: Path): Int =
-    Using.resource(Files.lines(path)) { lines =>
-      lines.count().toInt
-    }
+    try
+      val lines = Files.readAllLines(path, StandardCharsets.UTF_8)
+      lines.size()
+    catch
+      case _: Exception =>
+        // Try with default charset, or return 0 if that fails too
+        try
+          val lines = Files.readAllLines(path)
+          lines.size()
+        catch
+          case _: Exception => 0
 
   private def discoverTextFiles(root: Path, maxDepth: Int = 6, maxResults: Int = 20): Vector[Path] =
     if !Files.exists(root) then Vector.empty
@@ -427,11 +484,7 @@ object Main:
   private def promptYesNo(label: String, default: Boolean): Boolean =
     val defaultStr = if default then "Y/n" else "y/N"
     val raw = StdIn.readLine(s"$label [$defaultStr]: ")
-    if raw == null || raw.trim.isEmpty then default
-    else raw.trim.toLowerCase match
-      case "y" | "yes" | "1" | "true" => true
-      case "n" | "no" | "0" | "false" => false
-      case _ => default
+    if raw == null then default else CliHelpers.parseYesNo(raw, default)
 
   private def printUsage(): Unit =
     println(
