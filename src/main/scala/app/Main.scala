@@ -298,7 +298,8 @@ object Main:
 
     println()
 
-    val tokenizedInputs = inputPaths.map(path => TextPipeline.tokenize(readTextRobust(path, autoConfirm)))
+    val loadedInputs = inputPaths.map(path => readTextRobust(path, autoConfirm))
+    val tokenizedInputs = loadedInputs.map { case (_, text) => TextPipeline.tokenize(text) }
     val vocab = if actuallyFresh || !Files.isRegularFile(VocabPath) then
       TextPipeline.buildVocab(tokenizedInputs.flatten.toVector, maxVocab)
     else
@@ -320,13 +321,13 @@ object Main:
       println("Initializing new model...")
       LanguageModel.initParams(modelCfg, 42)
 
-    val phases = inputPaths.zipWithIndex.map { case (path, idx) =>
+    val phases = loadedInputs.zipWithIndex.map { case ((effectivePath, _), idx) =>
       val ids = TextPipeline.tokensToIds(tokenizedInputs(idx), vocab)
       val examples = TextPipeline.buildExamples(ids, contextSize)
       val (trainSet, valSet) = TextPipeline.splitDeterministic(examples, 0.9, 42 + idx)
-      require(trainSet.nonEmpty, s"Training set is empty for $path. Provide more text or reduce contextSize.")
-      require(valSet.nonEmpty, s"Validation set is empty for $path. Provide more text or reduce contextSize.")
-      Trainer.TrainingPhase(path.getFileName.toString, trainSet, valSet, inputWeights(idx))
+      require(trainSet.nonEmpty, s"Training set is empty for $effectivePath. Provide more text or reduce contextSize.")
+      require(valSet.nonEmpty, s"Validation set is empty for $effectivePath. Provide more text or reduce contextSize.")
+      Trainer.TrainingPhase(effectivePath.getFileName.toString, trainSet, valSet, inputWeights(idx))
     }.toVector
 
     val vocabHash = vocab.idToToken.mkString("|").hashCode.toHexString
@@ -513,8 +514,8 @@ object Main:
               suggested
           Some(target)
 
-  private def readTextRobust(path: Path, autoConfirm: Boolean): String =
-    try Files.readString(path, StandardCharsets.UTF_8)
+  private def readTextRobust(path: Path, autoConfirm: Boolean): (Path, String) =
+    try (path, Files.readString(path, StandardCharsets.UTF_8))
     catch
       case _: Exception =>
         val convertedPath =
@@ -523,8 +524,11 @@ object Main:
             None
           else maybeCreateUtf8Copy(path)
         convertedPath match
-          case Some(p) => Files.readString(p, StandardCharsets.UTF_8)
-          case None    => readTextWithSystemDefault(path)
+          case Some(p) =>
+            println(s"Using UTF-8 input for training: $p")
+            (p, Files.readString(p, StandardCharsets.UTF_8))
+          case None =>
+            (path, readTextWithSystemDefault(path))
 
   private def runChunker(flags: Map[String, String]): Unit =
     println("\n=== File Chunker ===\n")
