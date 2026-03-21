@@ -8,6 +8,14 @@ import scala.util.Random
 final case class Params(E: Matrix, W1: Matrix, b1: Vec, W2: Matrix, b2: Vec)
 final case class Grads(dE: Matrix, dW1: Matrix, db1: Vec, dW2: Matrix, db2: Vec)
 final case class ForwardCache(x: Vec, z1: Vec, a1: Vec, logits: Vec, probs: Vec, context: Vector[Int])
+final case class ForwardBatchCache(
+    x: Matrix,
+    z1: Matrix,
+    a1: Matrix,
+    logits: Matrix,
+    probs: Matrix,
+    contexts: Vector[Vector[Int]]
+)
 final case class ActivationCache(z1: Vec, a1: Vec)
 
 final case class ModelConfig(contextSize: Int, embedDim: Int, hiddenDim: Int, vocabSize: Int, activation: String = "tanh")
@@ -47,6 +55,29 @@ object LanguageModel:
   def lossFromCache(cache: ForwardCache, target: Int, backend: ComputeBackend = CpuBackend.Default): Double =
     backend.crossEntropy(cache.probs, target)
 
+  def forwardBatch(
+      p: Params,
+      contexts: Vector[Vector[Int]],
+      activation: String = "tanh",
+      backend: ComputeBackend = CpuBackend.Default
+  ): ForwardBatchCache =
+    require(contexts.nonEmpty, "contexts cannot be empty")
+    val inputDim = contexts.head.length * p.E.cols
+    require(contexts.forall(_.length == contexts.head.length), "all contexts in batch must have same length")
+
+    val x = Matrix(
+      contexts.flatMap(ctx => ctx.flatMap(id => p.E.rowSlice(id))),
+      rows = contexts.length,
+      cols = inputDim
+    )
+    val (z1, a1) = backend.linearActivationBatch(x, p.W1.transposeView, p.b1, activation)
+    val logits = backend.addRowBias(backend.matMul(a1, p.W2.transposeView), p.b2)
+    val probs = backend.softmaxStableBatch(logits)
+    ForwardBatchCache(x = x, z1 = z1, a1 = a1, logits = logits, probs = probs, contexts = contexts)
+
+  def lossFromBatchCache(cache: ForwardBatchCache, targets: Vector[Int], backend: ComputeBackend = CpuBackend.Default): Vec =
+    backend.crossEntropyBatch(cache.probs, targets)
+
   def backward(
       p: Params,
       cache: ForwardCache,
@@ -78,11 +109,52 @@ object LanguageModel:
 
     Grads(dE = dE, dW1 = dW1, db1 = db1, dW2 = dW2, db2 = db2)
 
+  def backwardBatch(
+      p: Params,
+      cache: ForwardBatchCache,
+      targets: Vector[Int],
+      activation: String = "tanh",
+      backend: ComputeBackend = CpuBackend.Default
+  ): Grads =
+    require(targets.length == cache.probs.rows, s"targets length ${targets.length} must equal batch size ${cache.probs.rows}")
+
+    val dLogits = Matrix.fromFunction(cache.probs.rows, cache.probs.cols) { (r, c) =>
+      val t = if c == targets(r) then 1.0 else 0.0
+      cache.probs.get(r, c) - t
+    }
+
+    val dW2 = backend.matMul(dLogits.transposeView, cache.a1)
+    val db2 = backend.reduceSumRows(dLogits)
+
+    val da1 = backend.matMul(dLogits, p.W2)
+    val dz1 = applyActivationGradBatch(da1, cache.z1, activation)
+
+    val dW1 = backend.matMul(dz1.transposeView, cache.x)
+    val db1 = backend.reduceSumRows(dz1)
+
+    val dx = backend.matMul(dz1, p.W1)
+    val dE = scatterEmbeddingGradBatch(dx, cache.contexts, p.E.rows, p.E.cols)
+
+    Grads(dE = dE, dW1 = dW1, db1 = db1, dW2 = dW2, db2 = db2)
+
   private def applyActivationGrad(grad: Vec, z: Vec, activation: String, backend: ComputeBackend): Vec =
     activation.toLowerCase match
       case "relu" => backend.hadamard(grad, backend.reluGrad(z))
       case "tanh" => backend.hadamard(grad, backend.tanhGrad(z))
       case _      => throw new IllegalArgumentException(s"Unknown activation: $activation. Use 'relu' or 'tanh'.")
+
+  private def applyActivationGradBatch(grad: Matrix, z: Matrix, activation: String): Matrix =
+    require(grad.rows == z.rows && grad.cols == z.cols, "activation grad batch shape mismatch")
+    Matrix.fromFunction(grad.rows, grad.cols) { (r, c) =>
+      val g = grad.get(r, c)
+      val zv = z.get(r, c)
+      activation.toLowerCase match
+        case "relu" => if zv > 0 then g else 0.0
+        case "tanh" =>
+          val t = math.tanh(zv)
+          g * (1.0 - t * t)
+        case _ => throw new IllegalArgumentException(s"Unknown activation: $activation. Use 'relu' or 'tanh'.")
+    }
 
   private def scatterEmbeddingGrad(dx: Vec, context: Vector[Int], vocabSize: Int, embedDim: Int): Matrix =
     require(dx.length == context.length * embedDim, s"dx length ${dx.length} must equal contextSize*embedDim ${context.length * embedDim}")
@@ -103,6 +175,31 @@ object LanguageModel:
 
       pos += 1
 
+    Matrix(accum.toVector, vocabSize, embedDim)
+
+  private def scatterEmbeddingGradBatch(dx: Matrix, contexts: Vector[Vector[Int]], vocabSize: Int, embedDim: Int): Matrix =
+    require(dx.rows == contexts.length, s"dx rows ${dx.rows} must equal batch size ${contexts.length}")
+    require(contexts.nonEmpty, "contexts cannot be empty")
+    val contextSize = contexts.head.length
+    require(dx.cols == contextSize * embedDim, s"dx cols ${dx.cols} must equal contextSize*embedDim ${contextSize * embedDim}")
+    require(contexts.forall(_.length == contextSize), "all contexts must have same length")
+
+    val accum = Array.fill(vocabSize * embedDim)(0.0)
+    var r = 0
+    while r < contexts.length do
+      val context = contexts(r)
+      var pos = 0
+      while pos < context.length do
+        val tokenId = context(pos)
+        require(tokenId >= 0 && tokenId < vocabSize, s"context token id out of range: $tokenId")
+        val baseDx = pos * embedDim
+        val baseRow = tokenId * embedDim
+        var j = 0
+        while j < embedDim do
+          accum(baseRow + j) += dx.get(r, baseDx + j)
+          j += 1
+        pos += 1
+      r += 1
     Matrix(accum.toVector, vocabSize, embedDim)
 
   def update(
@@ -178,3 +275,29 @@ object LanguageModel:
     val grads = backward(p, cache, ex.target, activation, backend)
     val updated = update(p, grads, lr, l2 = l2, clipNorm = clipNorm)
     (updated, loss)
+
+  def trainBatchStep(
+      p: Params,
+      batch: Vector[Example],
+      lr: Double,
+      l2: Double = 0.0,
+      clipNorm: Option[Double] = None,
+      activation: String = "tanh",
+      backend: ComputeBackend = CpuBackend.Default
+  ): (Params, Double) =
+    require(batch.nonEmpty, "batch cannot be empty")
+    val contexts = batch.map(_.context)
+    val targets = batch.map(_.target)
+    val cache = forwardBatch(p, contexts, activation, backend)
+    val losses = lossFromBatchCache(cache, targets, backend)
+    val grads = backwardBatch(p, cache, targets, activation, backend)
+    val scale = 1.0 / batch.length.toDouble
+    val scaled = Grads(
+      dE = grads.dE.map(_ * scale),
+      dW1 = grads.dW1.map(_ * scale),
+      db1 = grads.db1.map(_ * scale),
+      dW2 = grads.dW2.map(_ * scale),
+      db2 = grads.db2.map(_ * scale)
+    )
+    val updated = update(p, scaled, lr, l2 = l2, clipNorm = clipNorm)
+    (updated, losses.sum / losses.length.toDouble)

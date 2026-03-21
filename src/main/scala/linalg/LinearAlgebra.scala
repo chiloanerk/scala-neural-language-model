@@ -42,6 +42,54 @@ object LinearAlgebra:
       sum
     }
 
+  def matMul(a: Matrix, b: Matrix): Matrix =
+    require(a.cols == b.rows, s"matMul shape mismatch: a=(${a.rows},${a.cols}) b=(${b.rows},${b.cols})")
+    Matrix.fromFunction(a.rows, b.cols) { (r, c) =>
+      var sum = 0.0
+      var k = 0
+      while k < a.cols do
+        sum += a.get(r, k) * b.get(k, c)
+        k += 1
+      sum
+    }
+
+  def addRowBias(m: Matrix, bias: Vec): Matrix =
+    require(m.cols == bias.length, s"addRowBias shape mismatch: m.cols=${m.cols} bias=${bias.length}")
+    Matrix.fromFunction(m.rows, m.cols)((r, c) => m.get(r, c) + bias(c))
+
+  def reduceSumRows(m: Matrix): Vec =
+    Vector.tabulate(m.cols) { c =>
+      var sum = 0.0
+      var r = 0
+      while r < m.rows do
+        sum += m.get(r, c)
+        r += 1
+      sum
+    }
+
+  def softmaxStableBatch(logits: Matrix): Matrix =
+    if logits.rows == 0 then Matrix.zeros(0, logits.cols)
+    else
+      val out = Vector.newBuilder[Double]
+      out.sizeHint(logits.rows * logits.cols)
+      var r = 0
+      while r < logits.rows do
+        val probs = softmaxStable(logits.rowSlice(r))
+        var c = 0
+        while c < logits.cols do
+          out += probs(c)
+          c += 1
+        r += 1
+      Matrix(out.result(), logits.rows, logits.cols)
+
+  def crossEntropyBatch(probs: Matrix, targets: Vector[Int], epsilon: Double = 1e-12): Vector[Double] =
+    require(probs.rows == targets.length, s"crossEntropyBatch rows ${probs.rows} != targets ${targets.length}")
+    Vector.tabulate(probs.rows) { r =>
+      val t = targets(r)
+      require(t >= 0 && t < probs.cols, s"target index out of range at row $r: $t")
+      -log(math.max(probs.get(r, t), epsilon))
+    }
+
   def outer(a: Vec, b: Vec): Matrix =
     Matrix.fromFunction(a.length, b.length)((r, c) => a(r) * b(c))
 

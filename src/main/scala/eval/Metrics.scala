@@ -9,13 +9,17 @@ object Metrics:
       params: Params,
       examples: Vector[Example],
       activation: String = "tanh",
-      backend: ComputeBackend = CpuBackend.Default
+      backend: ComputeBackend = CpuBackend.Default,
+      batchSize: Int = 64
   ): Double =
     if examples.isEmpty then 0.0
     else
-      val total = examples.foldLeft(0.0) { (acc, ex) =>
-        val cache = LanguageModel.forward(params, ex.context, activation, backend)
-        acc + LanguageModel.lossFromCache(cache, ex.target, backend)
+      val effectiveBatch = math.max(1, batchSize)
+      val total = examples.grouped(effectiveBatch).foldLeft(0.0) { (acc, batch) =>
+        val contexts = batch.map(_.context).toVector
+        val targets = batch.map(_.target).toVector
+        val cache = LanguageModel.forwardBatch(params, contexts, activation, backend)
+        acc + LanguageModel.lossFromBatchCache(cache, targets, backend).sum
       }
       total / examples.length.toDouble
 

@@ -34,6 +34,9 @@ object Main:
     Console.out.flush()
     StdIn.readLine()
 
+  private def defaultPrecisionForBackend(backend: String): String =
+    if backend == "gpu" then "fp32" else "fp64"
+
   private def readTrimmedRequired(prompt: String, field: String): String =
     Option(readLineWithPrompt(prompt)) match
       case Some(v) => v.trim
@@ -184,7 +187,10 @@ object Main:
       presets(1)
     }
     val backend = BackendSelector.normalizeBackend(flags.getOrElse("backend", "gpu"))
-    val precision = BackendSelector.normalizePrecision(flags.getOrElse("precision", "fp64"))
+    val precision = BackendSelector.normalizePrecision(flags.getOrElse("precision", defaultPrecisionForBackend(backend)))
+    val batchSize = flags.get("batchSize").flatMap(_.toIntOption).getOrElse(0)
+    val prefetch = flags.get("prefetch").flatMap(_.toIntOption).getOrElse(1)
+    val profileGpu = flags.get("profileGpu").exists(CliHelpers.isTruthy)
     if flags.get("gpuInfo").exists(CliHelpers.isTruthy) then
       println(s"GPU info: ${BackendSelector.gpuInfo(precision)}")
 
@@ -218,6 +224,8 @@ object Main:
     println(s"  Context size: $contextSize")
     println(s"  Max vocab: $maxVocab")
     println(s"  Backend: $backend ($precision)")
+    if batchSize > 0 then println(s"  Batch size: $batchSize")
+    if profileGpu then println("  GPU profile: enabled")
     if actuallyFresh then
       println(s"  🆕 Starting fresh model (new architecture)")
     else if existingCfg.isDefined then
@@ -298,7 +306,10 @@ object Main:
       patience = preset.patience,
       activation = "tanh",
       backend = backend,
-      precision = precision
+      precision = precision,
+      batchSize = batchSize,
+      prefetch = prefetch,
+      profileGpu = profileGpu
     )
 
     // Train
@@ -446,7 +457,7 @@ object Main:
     val vocab = VocabIO.load(VocabPath)
     val backend = BackendSelector.fromConfig(
       flags.getOrElse("backend", "gpu"),
-      flags.getOrElse("precision", "fp64"),
+      flags.getOrElse("precision", defaultPrecisionForBackend(flags.getOrElse("backend", "gpu"))),
       warn = msg => println(s"[backend] $msg")
     )
 
@@ -478,7 +489,8 @@ object Main:
     }
 
   private def runGpuInfo(flags: Map[String, String]): Unit =
-    val precision = BackendSelector.normalizePrecision(flags.getOrElse("precision", "fp64"))
+    val backendName = BackendSelector.normalizeBackend(flags.getOrElse("backend", "gpu"))
+    val precision = BackendSelector.normalizePrecision(flags.getOrElse("precision", defaultPrecisionForBackend(backendName)))
     println(s"\nGPU probe ($precision): ${BackendSelector.gpuInfo(precision)}")
 
   private def runBenchmark(flags: Map[String, String]): Unit =
@@ -491,8 +503,10 @@ object Main:
     val contextSize = flags.get("contextSize").flatMap(_.toIntOption).getOrElse(3)
     val maxVocab = flags.get("maxVocab").flatMap(_.toIntOption).getOrElse(3000)
     val sample = flags.get("sample").flatMap(_.toIntOption).getOrElse(2000)
-    val precision = BackendSelector.normalizePrecision(flags.getOrElse("precision", "fp64"))
+    val benchmarkBackend = BackendSelector.normalizeBackend(flags.getOrElse("backend", "gpu"))
+    val precision = BackendSelector.normalizePrecision(flags.getOrElse("precision", defaultPrecisionForBackend(benchmarkBackend)))
     val activation = flags.getOrElse("activation", "tanh")
+    val batchSize = flags.get("batchSize").flatMap(_.toIntOption).getOrElse(0)
 
     val raw = Files.readString(inputPath, StandardCharsets.UTF_8)
     val tokens = TextPipeline.tokenize(raw)
@@ -508,10 +522,12 @@ object Main:
 
     def bench(label: String, backendName: String): Double =
       val backend = BackendSelector.fromConfig(backendName, precision, warn = _ => ())
-      val trainCfg = TrainConfig(epochs = 1, activation = activation, backend = backendName, precision = precision)
+      backend.resetProfile()
+      val trainCfg = TrainConfig(epochs = 1, activation = activation, backend = backendName, precision = precision, batchSize = batchSize, profileGpu = true)
       val sec = Trainer.estimateEpochSeconds(params, examples, trainCfg, backend, sampleSize = math.min(500, examples.length))
       val exPerSec = if sec <= 0 then 0.0 else examples.length / sec
       println(f"$label%-4s backend=${backend.diagnostics} | est=${sec}%.2fs for ${examples.length} ex | ${exPerSec}%.1f ex/s")
+      if backend.isGpu then println(s"     profile=${backend.profileSummary}")
       exPerSec
 
     val cpu = bench("CPU", "cpu")
@@ -601,7 +617,10 @@ object Main:
         |  --contextSize N   Words to look back (default: 3)
         |  --maxVocab N      Max unique words (default: 3000)
         |  --backend NAME    cpu|gpu (default: gpu)
-        |  --precision MODE  fp64|fp32 (default: fp64)
+        |  --precision MODE  fp64|fp32 (default: fp32 for gpu, fp64 for cpu)
+        |  --batchSize N     Mini-batch size (default: 128 gpu / 32 cpu)
+        |  --prefetch N      Prefetch window (1 or 2; default: 1)
+        |  --profileGpu      Print per-op GPU profile summary after training
         |  --gpuInfo         Print GPU probe details before training
         |
         |Chunking:
@@ -614,17 +633,19 @@ object Main:
         |  --context TEXT    Words to continue from
         |  --topK N          Predictions to show (default: 5)
         |  --backend NAME    cpu|gpu (default: gpu)
-        |  --precision MODE  fp64|fp32 (default: fp64)
+        |  --precision MODE  fp64|fp32 (default: fp32 for gpu, fp64 for cpu)
 
         |GPU:
         |  sbt "runMain app.Main gpu-info --precision fp64"
         |
         |Benchmark:
         |  --input FILE      Corpus text path
+        |  --backend NAME    cpu|gpu (default: gpu)
         |  --contextSize N   Context size (default: 3)
         |  --maxVocab N      Max vocab (default: 3000)
         |  --sample N        Number of examples (default: 2000)
-        |  --precision MODE  fp64|fp32 (default: fp64)
+        |  --precision MODE  fp64|fp32 (default: fp32 for gpu, fp64 for cpu)
+        |  --batchSize N     Batch size override for benchmark estimate
         |
         |Examples:
         |  sbt "runMain app.Main train --input data/corpus/text.txt"
