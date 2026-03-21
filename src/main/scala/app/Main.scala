@@ -14,6 +14,14 @@ import scala.jdk.CollectionConverters._
 import scala.util.Using
 
 object Main:
+  private val ProjectRoot = Path.of(".").toAbsolutePath.normalize
+
+  private def displayPath(path: Path): String =
+    val normalized = path.toAbsolutePath.normalize
+    if normalized.startsWith(ProjectRoot) then
+      val rel = ProjectRoot.relativize(normalized).toString
+      if rel.isEmpty then "." else rel
+    else path.toString
 
   // Persistent model paths
   val ModelPath = Path.of("data/models/latest.ckpt")
@@ -121,7 +129,7 @@ object Main:
     require(!(inputFlag.isDefined && inputsFlag.isDefined), "Use only one of --input or --inputs.")
 
     val actuallyFresh = if hasExistingModel && !freshTraining && inputFlag.isEmpty && inputsFlag.isEmpty then
-      println(s"Found existing model: $ModelPath (${Files.size(ModelPath) / 1024} KB)")
+      println(s"Found existing model: ${displayPath(ModelPath)} (${Files.size(ModelPath) / 1024} KB)")
       println()
       println("Choose action:")
       println("  1. Continue training (default)")
@@ -134,7 +142,7 @@ object Main:
       true
     else if hasExistingModel then
       val size = Files.size(ModelPath) / 1024
-      println(s"Found existing model: $ModelPath (${size} KB)")
+      println(s"Found existing model: ${displayPath(ModelPath)} (${size} KB)")
       println("This will continue training from where you left off.\n")
       false
     else
@@ -197,7 +205,7 @@ object Main:
 
         if !autoConfirm then
           println("\nReplay options:")
-          if replayFileExists then println(s"  Found replay memory: $replayFileDefault")
+          if replayFileExists then println(s"  Found replay memory: ${displayPath(replayFileDefault)}")
           else println("  No replay memory file found yet; one can be created after this run.")
           println("  What replay does: mixes old-domain examples into new training to reduce forgetting.")
           println("  Replay ratio guide:")
@@ -256,11 +264,11 @@ object Main:
     Files.createDirectories(ModelPath.getParent)
 
     println(s"\n=== Summary ===")
-    if inputPaths.length == 1 then println(s"  Input: ${inputPaths.head}")
+    if inputPaths.length == 1 then println(s"  Input: ${displayPath(inputPaths.head)}")
     else
       println(s"  Inputs (${inputPaths.length}):")
       inputPaths.zipWithIndex.foreach { case (p, idx) =>
-        println(f"    ${idx + 1}%2d. $p (weight=${inputWeights(idx)}%.3f)")
+        println(f"    ${idx + 1}%2d. ${displayPath(p)} (weight=${inputWeights(idx)}%.3f)")
       }
     println(s"  Preset: ${preset.name.capitalize} (${preset.epochs} epochs, patience=${preset.patience})")
     println(s"  Context size: $contextSize")
@@ -277,7 +285,7 @@ object Main:
         else if replayPersistenceEnabled then "persist"
         else if replayLoadRequested then "load-only"
         else "phased-only"
-      println(f"  Replay: mode=$mode ratio=$replayRatio%.2f bufferSize=$replayBufferSize path=$replayFile")
+      println(f"  Replay: mode=$mode ratio=$replayRatio%.2f bufferSize=$replayBufferSize path=${displayPath(replayFile)}")
     else println("  Replay: disabled")
     if ewcLambda > 0 then println(f"  EWC: enabled (lambda=$ewcLambda%.4f, samples=$ewcSamples)")
     if batchSize > 0 then println(s"  Batch size: $batchSize")
@@ -408,9 +416,9 @@ object Main:
     }
 
     if shouldSave then
-      println(s"\n✓ Model saved to $ModelPath")
-      println(s"  Vocab saved to $VocabPath")
-      if replayPersistenceEnabled then println(s"  Replay saved to $replayFile")
+      println(s"\n✓ Model saved to ${displayPath(ModelPath)}")
+      println(s"  Vocab saved to ${displayPath(VocabPath)}")
+      if replayPersistenceEnabled then println(s"  Replay saved to ${displayPath(replayFile)}")
     else
       println("\nTraining output discarded; checkpoint, vocab, and replay were not saved.")
     println(f"  Final$restoredNote: val_loss=${finalMetric.valLoss}%.4f val_ppl=${finalMetric.valPerplexity}%.1f")
@@ -440,13 +448,13 @@ object Main:
     recommended.zipWithIndex.foreach { case (p, idx) =>
       val (lines, size) = byPath(p)
       val linesStr = if lines > 0 then s"$lines lines" else "unknown lines"
-      println(s"    ${idx + 1}. $p ($linesStr, ${size} KB)")
+      println(s"    ${idx + 1}. ${displayPath(p)} ($linesStr, ${size} KB)")
     }
     if other.nonEmpty then println("  Other text files (likely derived; usually avoid):")
     other.zipWithIndex.foreach { case (p, idx) =>
       val (lines, size) = byPath(p)
       val linesStr = if lines > 0 then s"$lines lines" else "unknown lines"
-      println(s"    ${recommended.length + idx + 1}. $p ($linesStr, ${size} KB)")
+      println(s"    ${recommended.length + idx + 1}. ${displayPath(p)} ($linesStr, ${size} KB)")
     }
     println()
     var selected: Option[Path] = None
@@ -494,7 +502,7 @@ object Main:
     finally reader.close()
 
   private def maybeCreateUtf8Copy(path: Path): Option[Path] =
-    println(s"UTF-8 read failed for $path.")
+    println(s"UTF-8 read failed for ${displayPath(path)}.")
     val suggested = utf8CopyPath(path)
     Option(readLineWithPrompt("Create UTF-8 normalized copy and use it for this run? [Y/n]: ")) match
       case None =>
@@ -505,10 +513,10 @@ object Main:
         else
           val target =
             if Files.isRegularFile(suggested) then
-              println(s"Using existing UTF-8 copy: $suggested")
+              println(s"Using existing UTF-8 copy: ${displayPath(suggested)}")
               suggested
             else
-              println(s"Writing UTF-8 copy: $suggested")
+              println(s"Writing UTF-8 copy: ${displayPath(suggested)}")
               val decoded = readTextWithSystemDefault(path)
               Files.writeString(suggested, decoded, StandardCharsets.UTF_8)
               suggested
@@ -520,12 +528,12 @@ object Main:
       case _: Exception =>
         val convertedPath =
           if autoConfirm then
-            println(s"UTF-8 read failed for $path, trying with system default encoding...")
+            println(s"UTF-8 read failed for ${displayPath(path)}, trying with system default encoding...")
             None
           else maybeCreateUtf8Copy(path)
         convertedPath match
           case Some(p) =>
-            println(s"Using UTF-8 input for training: $p")
+            println(s"Using UTF-8 input for training: ${displayPath(p)}")
             (p, Files.readString(p, StandardCharsets.UTF_8))
           case None =>
             (path, readTextWithSystemDefault(path))
@@ -547,7 +555,7 @@ object Main:
         candidates.zipWithIndex.foreach { case (p, idx) =>
           val lines = countLines(p)
           val size = Files.size(p) / 1024
-          println(s"  ${idx + 1}. $p (${lines} lines, ${size} KB)")
+          println(s"  ${idx + 1}. ${displayPath(p)} (${lines} lines, ${size} KB)")
         }
         println()
         
@@ -563,7 +571,7 @@ object Main:
     
     val totalLines = countLines(inputPath)
     val sizeKB = Files.size(inputPath) / 1024
-    println(s"\nSelected: $inputPath")
+    println(s"\nSelected: ${displayPath(inputPath)}")
     println(s"Size: ${totalLines} lines, ${sizeKB} KB\n")
 
     // Get chunk size
@@ -594,8 +602,8 @@ object Main:
     val baseName = flags.getOrElse("name", inputPath.getFileName.toString.replace(".txt", ""))
 
     println(s"\nChunking plan:")
-    println(s"  Input: $inputPath (${totalLines} lines)")
-    println(s"  Output: $outputDir/")
+    println(s"  Input: ${displayPath(inputPath)} (${totalLines} lines)")
+    println(s"  Output: ${displayPath(outputDir)}/")
     println(s"  Chunk size: $chunkSize lines")
     val autoConfirm = flags.get("yes").exists(CliHelpers.isTruthy)
     
@@ -633,7 +641,7 @@ object Main:
       chunkNum += 1
       lineIdx = endIdx
 
-    println(s"\n✓ Created $totalChunks chunks in $outputDir/")
+    println(s"\n✓ Created $totalChunks chunks in ${displayPath(outputDir)}/")
     println()
     println("Next steps:")
     println(s"  sbt \"runMain app.Main train --input $outputDir/${baseName}-part1.txt --preset quick\"")
