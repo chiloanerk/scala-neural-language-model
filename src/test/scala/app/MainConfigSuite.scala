@@ -1,0 +1,35 @@
+package app
+
+import munit.FunSuite
+import train.TrainConfig
+
+class MainConfigSuite extends FunSuite:
+  test("training presets use conservative learning rates for longer runs") {
+    val byName = Main.presets.map(p => p.name -> p).toMap
+    assertEqualsDouble(byName("quick").learningRate, 0.05, 1e-12)
+    assertEqualsDouble(byName("balanced").learningRate, 0.02, 1e-12)
+    assertEqualsDouble(byName("thorough").learningRate, 0.01, 1e-12)
+  }
+
+  test("TrainConfig default precision is fp64") {
+    val cfg = TrainConfig()
+    assertEquals(cfg.precision, "fp64")
+  }
+
+  test("benchmarkMatrix defaults to cpu/gpu x fp64/fp32") {
+    val combos = Main.benchmarkMatrix(None, None).toSet
+    assertEquals(
+      combos,
+      Set(
+        ("cpu", "fp64"),
+        ("cpu", "fp32"),
+        ("gpu", "fp64"),
+        ("gpu", "fp32")
+      )
+    )
+  }
+
+  test("benchmarkMatrix respects explicit backend and precision") {
+    val combos = Main.benchmarkMatrix(Some("gpu"), Some("fp32"))
+    assertEquals(combos, Vector(("gpu", "fp32")))
+  }

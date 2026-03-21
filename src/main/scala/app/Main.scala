@@ -20,12 +20,20 @@ object Main:
   val VocabPath = Path.of("data/models/latest.vocab")
 
   // Training presets
-  case class Preset(name: String, epochs: Int, patience: Int, hiddenDim: Int, embedDim: Int, description: String)
+  case class Preset(
+      name: String,
+      epochs: Int,
+      patience: Int,
+      hiddenDim: Int,
+      embedDim: Int,
+      learningRate: Double,
+      description: String
+  )
 
   val presets = Vector(
-    Preset("quick", 5, 3, 32, 16, "Test (~30 sec)"),
-    Preset("balanced", 20, 5, 64, 24, "Standard (~2 min)"),
-    Preset("thorough", 50, 10, 128, 48, "Best quality (~10 min)")
+    Preset("quick", 5, 3, 32, 16, 0.05, "Test (~30 sec)"),
+    Preset("balanced", 20, 5, 64, 24, 0.02, "Standard (~2 min)"),
+    Preset("thorough", 50, 10, 128, 48, 0.01, "Best quality (~10 min)")
   )
 
   private def readLineWithPrompt(prompt: String): String | Null =
@@ -35,7 +43,19 @@ object Main:
     StdIn.readLine()
 
   private def defaultPrecisionForBackend(backend: String): String =
-    if backend == "gpu" then "fp32" else "fp64"
+    "fp64"
+
+  private[app] def benchmarkMatrix(backendFlag: Option[String], precisionFlag: Option[String]): Vector[(String, String)] =
+    val backends = backendFlag match
+      case Some(b) => Vector(BackendSelector.normalizeBackend(b))
+      case None    => Vector("cpu", "gpu")
+    val precisions = precisionFlag match
+      case Some(p) => Vector(BackendSelector.normalizePrecision(p))
+      case None    => Vector("fp64", "fp32")
+    for
+      b <- backends
+      p <- precisions
+    yield (b, p)
 
   private def readTrimmedRequired(prompt: String, field: String): String =
     Option(readLineWithPrompt(prompt)) match
@@ -70,7 +90,7 @@ object Main:
 
     println(
       s"""
-      |=== Neural Language Model ===
+      |=== Scala Neural Language Model (NLM) ===
       |
       |Status: $modelStatus
       |
@@ -188,6 +208,8 @@ object Main:
     }
     val backend = BackendSelector.normalizeBackend(flags.getOrElse("backend", "gpu"))
     val precision = BackendSelector.normalizePrecision(flags.getOrElse("precision", defaultPrecisionForBackend(backend)))
+    val learningRate = flags.get("lr").flatMap(_.toDoubleOption).getOrElse(preset.learningRate)
+    val lrDecay = flags.get("lrDecay").flatMap(_.toDoubleOption).getOrElse(1.0)
     val batchSize = flags.get("batchSize").flatMap(_.toIntOption).getOrElse(0)
     val prefetch = flags.get("prefetch").flatMap(_.toIntOption).getOrElse(1)
     val profileGpu = flags.get("profileGpu").exists(CliHelpers.isTruthy)
@@ -224,6 +246,7 @@ object Main:
     println(s"  Context size: $contextSize")
     println(s"  Max vocab: $maxVocab")
     println(s"  Backend: $backend ($precision)")
+    println(f"  Learning rate: $learningRate%.4f (decay=$lrDecay%.4f)")
     if batchSize > 0 then println(s"  Batch size: $batchSize")
     if profileGpu then println("  GPU profile: enabled")
     if actuallyFresh then
@@ -297,8 +320,8 @@ object Main:
 
     val trainCfg = TrainConfig(
       epochs = preset.epochs,
-      learningRate = 0.05,
-      lrDecay = 1.0,
+      learningRate = learningRate,
+      lrDecay = lrDecay,
       l2 = 0.0,
       clipNorm = None,
       shuffleEachEpoch = true,
@@ -320,14 +343,20 @@ object Main:
     VocabIO.save(vocab, VocabPath)
 
     println("\n=== Results ===")
+    val bestMetric = result.history.minBy(_.valLoss)
+    val finalMetric = if trainCfg.patience > 0 then bestMetric else result.history.last
+    val restoredNote = if trainCfg.patience > 0 then " (restored best)" else ""
     result.history.foreach { m =>
-      val indicator = if m.valLoss == result.history.map(_.valLoss).min then " ← best" else ""
+      val indicator = if m.epoch == bestMetric.epoch then " ← best" else ""
       println(f"  Epoch ${m.epoch}%2d: train=${m.trainLoss}%.4f val=${m.valLoss}%.4f ppl=${m.valPerplexity}%.1f$indicator")
     }
 
     println(s"\n✓ Model saved to $ModelPath")
     println(s"  Vocab saved to $VocabPath")
-    println(f"  Final: val_loss=${result.history.last.valLoss}%.4f val_ppl=${result.history.last.valPerplexity}%.1f")
+    println(f"  Final$restoredNote: val_loss=${finalMetric.valLoss}%.4f val_ppl=${finalMetric.valPerplexity}%.1f")
+    if trainCfg.patience > 0 then
+      val last = result.history.last
+      println(f"  Last epoch (pre-restore): val_loss=${last.valLoss}%.4f val_ppl=${last.valPerplexity}%.1f")
     println()
     println("Continue with: sbt \"runMain app.Main train --input <more-data.txt>\"")
     println("Or predict:    sbt \"runMain app.Main predict --context 'your text'\"")
@@ -503,8 +532,8 @@ object Main:
     val contextSize = flags.get("contextSize").flatMap(_.toIntOption).getOrElse(3)
     val maxVocab = flags.get("maxVocab").flatMap(_.toIntOption).getOrElse(3000)
     val sample = flags.get("sample").flatMap(_.toIntOption).getOrElse(2000)
-    val benchmarkBackend = BackendSelector.normalizeBackend(flags.getOrElse("backend", "gpu"))
-    val precision = BackendSelector.normalizePrecision(flags.getOrElse("precision", defaultPrecisionForBackend(benchmarkBackend)))
+    val benchmarkBackendFlag = flags.get("backend")
+    val precisionFlag = flags.get("precision")
     val activation = flags.getOrElse("activation", "tanh")
     val batchSize = flags.get("batchSize").flatMap(_.toIntOption).getOrElse(0)
 
@@ -520,7 +549,7 @@ object Main:
     val cfg = ModelConfig(contextSize = contextSize, embedDim = 24, hiddenDim = 64, vocabSize = vocab.size, activation = activation)
     val params = LanguageModel.initParams(cfg, seed = 42)
 
-    def bench(label: String, backendName: String): Double =
+    def bench(label: String, backendName: String, precision: String): Double =
       val backend = BackendSelector.fromConfig(backendName, precision, warn = _ => ())
       backend.resetProfile()
       val trainCfg = TrainConfig(epochs = 1, activation = activation, backend = backendName, precision = precision, batchSize = batchSize, profileGpu = true)
@@ -530,37 +559,55 @@ object Main:
       if backend.isGpu then println(s"     profile=${backend.profileSummary}")
       exPerSec
 
-    val cpu = bench("CPU", "cpu")
-    val gpu = bench("GPU", "gpu")
-    if cpu > 0 && gpu > 0 then println(f"Speedup (GPU/CPU): ${gpu / cpu}%.2fx")
+    val results = scala.collection.mutable.Map.empty[(String, String), Double]
+    val combos = benchmarkMatrix(benchmarkBackendFlag, precisionFlag)
+    combos.foreach { case (backendName, precision) =>
+      val label = s"${backendName.toUpperCase}[$precision]"
+      val exPerSec = bench(label, backendName, precision)
+      results((backendName, precision)) = exPerSec
+    }
 
-    println("\nPer-op timing (synthetic)")
-    def benchOps(label: String, backendName: String): Unit =
-      val backend = BackendSelector.fromConfig(backendName, precision, warn = _ => ())
-      val rows = 256
-      val cols = 256
-      val m = linalg.Matrix.fromFunction(rows, cols)((r, c) => ((r + c) % 17) * 0.01)
-      val x = Vector.tabulate(cols)(i => (i % 13) * 0.01)
-      val b = Vector.tabulate(rows)(i => (i % 7) * 0.01)
-      val a = Vector.tabulate(rows)(i => (i % 11) * 0.01)
-      val o = Vector.tabulate(cols)(i => (i % 5) * 0.01)
-      val iters = 100
+    Vector("fp64", "fp32").foreach { precision =>
+      val cpu = results.get(("cpu", precision))
+      val gpu = results.get(("gpu", precision))
+      (cpu, gpu) match
+        case (Some(c), Some(g)) if c > 0 && g > 0 =>
+          println(f"Speedup (GPU/CPU, $precision): ${g / c}%.2fx")
+        case _ => ()
+    }
 
-      def timeMs(fn: => Unit): Double =
-        val t0 = System.nanoTime()
-        var i = 0
-        while i < iters do
-          fn
-          i += 1
-        (System.nanoTime() - t0).toDouble / 1e6
+    val opPrecisions = precisionFlag.map(BackendSelector.normalizePrecision).map(Vector(_)).getOrElse(Vector("fp64", "fp32"))
+    opPrecisions.foreach { precision =>
+      println(s"\nPer-op timing (synthetic, $precision)")
+      def benchOps(label: String, backendName: String): Unit =
+        val backend = BackendSelector.fromConfig(backendName, precision, warn = _ => ())
+        val rows = 256
+        val cols = 256
+        val m = linalg.Matrix.fromFunction(rows, cols)((r, c) => ((r + c) % 17) * 0.01)
+        val x = Vector.tabulate(cols)(i => (i % 13) * 0.01)
+        val b = Vector.tabulate(rows)(i => (i % 7) * 0.01)
+        val a = Vector.tabulate(rows)(i => (i % 11) * 0.01)
+        val o = Vector.tabulate(cols)(i => (i % 5) * 0.01)
+        val iters = 100
 
-      val matVecMs = timeMs { backend.matVecMul(m, x); () }
-      val outerMs = timeMs { backend.outer(a, o); () }
-      val fusedMs = timeMs { backend.linearActivation(m, x, b, activation); () }
-      println(f"$label%-4s matVec=${matVecMs / iters}%.3fms outer=${outerMs / iters}%.3fms fused=${fusedMs / iters}%.3fms")
+        def timeMs(fn: => Unit): Double =
+          val t0 = System.nanoTime()
+          var i = 0
+          while i < iters do
+            fn
+            i += 1
+          (System.nanoTime() - t0).toDouble / 1e6
 
-    benchOps("CPU", "cpu")
-    benchOps("GPU", "gpu")
+        val matVecMs = timeMs { backend.matVecMul(m, x); () }
+        val outerMs = timeMs { backend.outer(a, o); () }
+        val fusedMs = timeMs { backend.linearActivation(m, x, b, activation); () }
+        println(f"$label%-4s matVec=${matVecMs / iters}%.3fms outer=${outerMs / iters}%.3fms fused=${fusedMs / iters}%.3fms")
+
+      val opBackends = benchmarkBackendFlag.map(BackendSelector.normalizeBackend).map(Vector(_)).getOrElse(Vector("cpu", "gpu"))
+      opBackends.foreach { b =>
+        benchOps(b.toUpperCase, b)
+      }
+    }
 
   private def adaptContext(ids: Vector[Int], contextSize: Int, padId: Int): Vector[Int] =
     if ids.length >= contextSize then ids.takeRight(contextSize)
@@ -617,7 +664,9 @@ object Main:
         |  --contextSize N   Words to look back (default: 3)
         |  --maxVocab N      Max unique words (default: 3000)
         |  --backend NAME    cpu|gpu (default: gpu)
-        |  --precision MODE  fp64|fp32 (default: fp32 for gpu, fp64 for cpu)
+        |  --precision MODE  fp64|fp32 (default: fp64)
+        |  --lr VALUE        Learning rate override (default: preset-specific)
+        |  --lrDecay VALUE   Learning-rate decay per epoch (default: 1.0)
         |  --batchSize N     Mini-batch size (default: 128 gpu / 32 cpu)
         |  --prefetch N      Prefetch window (1 or 2; default: 1)
         |  --profileGpu      Print per-op GPU profile summary after training
@@ -633,18 +682,18 @@ object Main:
         |  --context TEXT    Words to continue from
         |  --topK N          Predictions to show (default: 5)
         |  --backend NAME    cpu|gpu (default: gpu)
-        |  --precision MODE  fp64|fp32 (default: fp32 for gpu, fp64 for cpu)
+        |  --precision MODE  fp64|fp32 (default: fp64)
 
         |GPU:
         |  sbt "runMain app.Main gpu-info --precision fp64"
         |
         |Benchmark:
         |  --input FILE      Corpus text path
-        |  --backend NAME    cpu|gpu (default: gpu)
+        |  --backend NAME    cpu|gpu (default: run both)
         |  --contextSize N   Context size (default: 3)
         |  --maxVocab N      Max vocab (default: 3000)
         |  --sample N        Number of examples (default: 2000)
-        |  --precision MODE  fp64|fp32 (default: fp32 for gpu, fp64 for cpu)
+        |  --precision MODE  fp64|fp32 (default: run both)
         |  --batchSize N     Batch size override for benchmark estimate
         |
         |Examples:

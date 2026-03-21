@@ -2,6 +2,7 @@ package train
 
 import munit.FunSuite
 import data.Example
+import eval.Metrics
 import nn.{LanguageModel, ModelConfig}
 
 class TrainerSuite extends FunSuite:
@@ -34,6 +35,23 @@ class TrainerSuite extends FunSuite:
     val result = Trainer.train(p0, trainSet, valSet, TrainConfig(epochs = 12, learningRate = 0.05, patience = 2, seed = 20, backend = "cpu"))
     assert(result.history.length <= 12)
     assert(result.history.nonEmpty)
+  }
+
+  test("early stopping restores best params by validation loss") {
+    val p0 = LanguageModel.initParams(cfg, seed = 21)
+    val trainSet = Vector.fill(30)(Example(Vector(1, 2), 3))
+    val valSet = Vector.fill(10)(Example(Vector(1, 2), 4))
+
+    val result = Trainer.train(
+      p0,
+      trainSet,
+      valSet,
+      TrainConfig(epochs = 10, learningRate = 0.05, patience = 2, seed = 21, backend = "cpu", precision = "fp64")
+    )
+
+    val bestHistoryVal = result.history.map(_.valLoss).min
+    val restoredVal = Metrics.meanLoss(result.params, valSet, activation = "tanh", batchSize = 8)
+    assert(math.abs(restoredVal - bestHistoryVal) < 1e-6)
   }
 
   test("train supports configurable batch sizes") {

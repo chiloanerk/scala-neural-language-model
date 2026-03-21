@@ -2,6 +2,7 @@ package nn
 
 import munit.FunSuite
 import data.Example
+import linalg.LinearAlgebra
 
 class LanguageModelSuite extends FunSuite:
   private def cfg = ModelConfig(contextSize = 2, embedDim = 3, hiddenDim = 4, vocabSize = 7, activation = "tanh")
@@ -101,4 +102,20 @@ class LanguageModelSuite extends FunSuite:
     assert(math.abs(l1 - l2) < 1e-9)
     val maxDiff = u1.W2.data.zip(u2.W2.data).map { case (a, b) => math.abs(a - b) }.max
     assert(maxDiff < 1e-9)
+  }
+
+  test("model output supports top-2 and top-3 predictions with sorted valid ids") {
+    val p = LanguageModel.initParams(cfg, seed = 11)
+    val cache = LanguageModel.forward(p, Vector(1, 2), "tanh")
+
+    val top2 = LinearAlgebra.argTopK(cache.probs, 2)
+    val top3 = LinearAlgebra.argTopK(cache.probs, 3)
+
+    assertEquals(top2.length, 2)
+    assertEquals(top3.length, 3)
+    assert(top2.forall { case (id, prob) => id >= 0 && id < cfg.vocabSize && prob.isFinite && prob >= 0.0 })
+    assert(top3.forall { case (id, prob) => id >= 0 && id < cfg.vocabSize && prob.isFinite && prob >= 0.0 })
+    assert(top2(0)._2 >= top2(1)._2)
+    assert(top3(0)._2 >= top3(1)._2 && top3(1)._2 >= top3(2)._2)
+    assert(top3.map(_._1).distinct.length == 3)
   }

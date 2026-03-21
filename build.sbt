@@ -5,7 +5,7 @@ Global / excludeLintKeys += Compile / runMain / connectInput
 
 lazy val root = (project in file("."))
   .settings(
-    name := "scala-next-word-from-scratch",
+    name := "scala-neural-language-model-nlm",
     libraryDependencies += "org.scalameta" %% "munit" % "1.0.2" % Test,
     Compile / run / fork := true,
     Compile / run / connectInput := true,

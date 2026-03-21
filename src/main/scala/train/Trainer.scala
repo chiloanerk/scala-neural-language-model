@@ -17,7 +17,7 @@ final case class TrainConfig(
     patience: Int = 0,  // 0 = disabled, >0 = early stopping enabled
     activation: String = "tanh",
     backend: String = "gpu",
-    precision: String = "fp32",
+    precision: String = "fp64",
     batchSize: Int = 0,
     prefetch: Int = 1,
     profileGpu: Boolean = false

@@ -1,6 +1,22 @@
-# Scala 3 Next-Word Predictor (From Scratch)
+# Scala Neural Language Model (NLM)
 
 A pure Scala 3 implementation of a neural language model. Train incrementally on your text, predict next words.
+
+## Tested Platform and Observed Performance
+
+This project has been tested only on:
+
+- Apple MacBook Air (Apple M1, macOS)
+
+Observed results on this device (from local runs):
+
+- Full training run throughput on `bbc-business.txt`: ~`2600-3200 examples/sec` (GPU, `fp32`, batch size `128`)
+- Benchmark run (`--sample 5000`, `fp32`, batch size `128`):
+  - CPU: `136.0 examples/sec` (estimated `36.75s`)
+  - GPU: `1299.6 examples/sec` (estimated `3.85s`)
+  - Observed speedup: `9.55x`
+
+Performance will vary on other hardware and this repo has not yet been validated on non-M1 devices.
 
 ## Quick Start
 
