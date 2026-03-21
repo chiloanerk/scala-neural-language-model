@@ -373,8 +373,8 @@ object Main:
       val last = result.history.last
       println(f"  Last epoch (pre-restore): val_loss=${last.valLoss}%.4f val_ppl=${last.valPerplexity}%.1f")
     println()
-    println("Continue with: sbt \"runMain app.Main train --input <more-data.txt>\"")
-    println("Or predict:    sbt \"runMain app.Main predict --context 'your text'\"")
+    println("Continue with: sbt \"run train --input <more-data.txt>\"")
+    println("Or predict:    sbt \"run predict --context 'your text'\"")
 
   private def runChunker(flags: Map[String, String]): Unit =
     println("\n=== File Chunker ===\n")
