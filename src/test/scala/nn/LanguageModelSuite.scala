@@ -1,6 +1,7 @@
 package nn
 
 import munit.FunSuite
+import compute.{CpuBackend, MetalBackend}
 import data.Example
 import linalg.LinearAlgebra
 
@@ -118,4 +119,33 @@ class LanguageModelSuite extends FunSuite:
     assert(top2(0)._2 >= top2(1)._2)
     assert(top3(0)._2 >= top3(1)._2 && top3(1)._2 >= top3(2)._2)
     assert(top3.map(_._1).distinct.length == 3)
+  }
+
+  test("trainBatchStep parity cpu vs gpu for one batch when gpu is available") {
+    val gpu = MetalBackend.create("fp64")
+    if !gpu.isGpu then assert(true)
+    else
+      val p = LanguageModel.initParams(cfg, seed = 12)
+      val batch = Vector(
+        Example(Vector(1, 2), 3),
+        Example(Vector(2, 3), 4),
+        Example(Vector(3, 4), 5),
+        Example(Vector(4, 5), 6)
+      )
+
+      val (cpuUpdated, cpuLoss) =
+        LanguageModel.trainBatchStep(p, batch, lr = 0.01, activation = "tanh", backend = CpuBackend("fp64"))
+      val (gpuUpdated, gpuLoss) =
+        LanguageModel.trainBatchStep(p, batch, lr = 0.01, activation = "tanh", backend = gpu)
+
+      assert(math.abs(cpuLoss - gpuLoss) < 1e-4)
+
+      def maxDiff(a: Vector[Double], b: Vector[Double]): Double =
+        a.zip(b).map((x, y) => math.abs(x - y)).max
+
+      assert(maxDiff(cpuUpdated.E.data, gpuUpdated.E.data) < 1e-4)
+      assert(maxDiff(cpuUpdated.W1.data, gpuUpdated.W1.data) < 1e-4)
+      assert(maxDiff(cpuUpdated.b1, gpuUpdated.b1) < 1e-4)
+      assert(maxDiff(cpuUpdated.W2.data, gpuUpdated.W2.data) < 1e-4)
+      assert(maxDiff(cpuUpdated.b2, gpuUpdated.b2) < 1e-4)
   }

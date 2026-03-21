@@ -50,7 +50,7 @@ class BackendSelectorSuite extends FunSuite:
       val cpu = CpuBackend("fp64").outer(a, c)
       val gpu = b.outer(a, c)
       val maxErr = cpu.data.zip(gpu.data).map((x, y) => math.abs(x - y)).max
-      assert(maxErr < 1e-4)
+      assert(maxErr < 1e-4, s"maxErr=$maxErr")
   }
 
   test("metal fused linearActivation parity when gpu is available") {
@@ -80,6 +80,20 @@ class BackendSelectorSuite extends FunSuite:
       assert(maxErr < 1e-4)
   }
 
+  test("metal batch matMul parity with transpose view inputs when gpu is available") {
+    val b = MetalBackend.create("fp32")
+    if !b.isGpu then assert(true)
+    else
+      val baseA = Matrix.fromFunction(3, 4)((r, c) => ((r * 5 + c * 2) % 13) * 0.1 - 0.4)
+      val baseB = Matrix.fromFunction(5, 3)((r, c) => ((r * 3 + c) % 11) * 0.08 - 0.2)
+      val a = baseA.transposeView // (4x3) view
+      val c = baseB.transposeView // (3x5) view
+      val cpu = CpuBackend("fp64").matMul(a, c)
+      val gpu = b.matMul(a, c)
+      val maxErr = cpu.data.zip(gpu.data).map((x, y) => math.abs(x - y)).max
+      assert(maxErr < 1e-4)
+  }
+
   test("metal batch linearActivation parity when gpu is available") {
     val b = MetalBackend.create("fp32")
     if !b.isGpu then assert(true)
@@ -89,6 +103,22 @@ class BackendSelectorSuite extends FunSuite:
       val bias = Vector(0.01, -0.02, 0.03, 0.04)
       val cpu = CpuBackend("fp64").linearActivationBatch(x, wT, bias, "tanh")
       val gpu = b.linearActivationBatch(x, wT, bias, "tanh")
+      val maxErrZ = cpu._1.data.zip(gpu._1.data).map((a, z) => math.abs(a - z)).max
+      val maxErrA = cpu._2.data.zip(gpu._2.data).map((a, z) => math.abs(a - z)).max
+      assert(maxErrZ < 1e-4)
+      assert(maxErrA < 1e-4)
+  }
+
+  test("metal batch linearActivation parity with transpose view weights when gpu is available") {
+    val b = MetalBackend.create("fp32")
+    if !b.isGpu then assert(true)
+    else
+      val x = Matrix.fromFunction(6, 4)((r, c) => ((r + c * 3) % 9) * 0.09 - 0.3)
+      val w = Matrix.fromFunction(3, 4)((r, c) => ((r * 7 + c * 2) % 17) * 0.04 - 0.2)
+      val wTView = w.transposeView // (4x3) lazy transpose view
+      val bias = Vector(0.01, -0.02, 0.03)
+      val cpu = CpuBackend("fp64").linearActivationBatch(x, wTView, bias, "tanh")
+      val gpu = b.linearActivationBatch(x, wTView, bias, "tanh")
       val maxErrZ = cpu._1.data.zip(gpu._1.data).map((a, z) => math.abs(a - z)).max
       val maxErrA = cpu._2.data.zip(gpu._2.data).map((a, z) => math.abs(a - z)).max
       assert(maxErrZ < 1e-4)

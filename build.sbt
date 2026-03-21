@@ -11,5 +11,6 @@ lazy val root = (project in file("."))
     Compile / run / connectInput := true,
     Compile / runMain / connectInput := true,
     Compile / run / javaOptions += s"-Dmetal.jni.lib=${(ThisBuild / baseDirectory).value.getAbsolutePath}/metal-jni/build/libmetal_jni.dylib",
-    Test / javaOptions += s"-Dmetal.jni.lib=${(ThisBuild / baseDirectory).value.getAbsolutePath}/metal-jni/build/libmetal_jni.dylib"
+    Test / javaOptions += s"-Dmetal.jni.lib=${(ThisBuild / baseDirectory).value.getAbsolutePath}/metal-jni/build/libmetal_jni.dylib",
+    Test / parallelExecution := false
   )
