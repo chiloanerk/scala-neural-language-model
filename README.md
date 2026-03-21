@@ -48,6 +48,12 @@ sbt "run train"
 sbt "run train --input data/corpus/example-corpus.txt --preset balanced --yes --contextSize 3 --maxVocab 3000"
 ```
 
+### 3b) Continual replay training (multi-corpus)
+
+```bash
+sbt "run train --inputs data/corpus/a.txt,data/corpus/b.txt --inputWeights 0.7,0.3 --replayRatio 0.3 --replayBufferSize 10000 --yes"
+```
+
 ### 4) Predict
 
 ```bash
@@ -100,6 +106,8 @@ sbt "run train [options]"
 Key options:
 
 - `--input FILE`
+- `--inputs CSV` (multi-corpus, comma-separated)
+- `--inputWeights CSV` (optional per-input weights, normalized)
 - `--preset quick|balanced|thorough` (default: `balanced`)
 - `--fresh` (start new model, ignore existing checkpoint)
 - `--contextSize N`
@@ -112,6 +120,11 @@ Key options:
 - `--prefetch N`
 - `--profileGpu`
 - `--gpuInfo`
+- `--replayRatio VALUE` (default: `0.3`)
+- `--replayBufferSize N` (default: `0`, disables replay persistence)
+- `--replayBufferPath FILE` (optional; default `data/models/latest.replay` when replay is enabled)
+- `--ewcLambda VALUE` (default: `0.0`, off)
+- `--ewcSamples N` (optional EWC sampling count)
 - `--yes` (auto-confirm final prompt)
 
 Preset learning rates:

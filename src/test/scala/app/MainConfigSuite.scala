@@ -14,6 +14,9 @@ class MainConfigSuite extends FunSuite:
   test("TrainConfig default precision is fp64") {
     val cfg = TrainConfig()
     assertEquals(cfg.precision, "fp64")
+    assertEquals(cfg.replayRatio, 0.0)
+    assertEquals(cfg.replayBufferSize, 0)
+    assertEquals(cfg.ewcLambda, 0.0)
   }
 
   test("benchmarkMatrix defaults to cpu/gpu x fp64/fp32") {

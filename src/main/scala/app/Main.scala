@@ -5,7 +5,7 @@ import data.{TextPipeline, VocabIO}
 import eval.Metrics
 import linalg.LinearAlgebra
 import nn.{LanguageModel, ModelConfig}
-import train.{CheckpointIO, SaveDecision, TrainConfig, Trainer}
+import train.{CheckpointIO, ReplayBuffer, SaveDecision, TrainConfig, Trainer}
 
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path}
@@ -18,6 +18,7 @@ object Main:
   // Persistent model paths
   val ModelPath = Path.of("data/models/latest.ckpt")
   val VocabPath = Path.of("data/models/latest.vocab")
+  val ReplayPath = Path.of("data/models/latest.replay")
 
   // Training presets
   case class Preset(
@@ -112,12 +113,14 @@ object Main:
   private def runTrain(flags: Map[String, String]): Unit =
     println("\n=== Training ===\n")
 
-    // Check for existing model
     val freshTraining = flags.get("fresh").exists(CliHelpers.isTruthy)
     val hasExistingModel = Files.isRegularFile(ModelPath)
+    val inputFlag = flags.get("input").map(_.trim).filter(_.nonEmpty)
+    val inputsFlag = flags.get("inputs").map(_.trim).filter(_.nonEmpty)
 
-    // Ask if user wants fresh start when model exists AND no flag provided
-    val actuallyFresh = if hasExistingModel && !freshTraining && !flags.contains("input") then
+    require(!(inputFlag.isDefined && inputsFlag.isDefined), "Use only one of --input or --inputs.")
+
+    val actuallyFresh = if hasExistingModel && !freshTraining && inputFlag.isEmpty && inputsFlag.isEmpty then
       println(s"Found existing model: $ModelPath (${Files.size(ModelPath) / 1024} KB)")
       println()
       println("Choose action:")
@@ -138,62 +141,22 @@ object Main:
       println("No existing model found. Starting fresh training.\n")
       false
 
-    // Get input file
-    val inputPath = flags.get("input") match
-      case Some(path) => Path.of(path)
+    val inputPaths: Vector[Path] = inputsFlag match
+      case Some(csv) => csv.split(",").toVector.map(_.trim).filter(_.nonEmpty).map(Path.of(_))
       case None =>
-        // Discover text files
-        val candidates = discoverTextFiles(Path.of(".").toAbsolutePath.normalize, maxDepth = 6)
-          .filter(p => !p.toString.contains("/chunks/")) // Skip chunked files
-        
-        // Count lines for each file (with fallback for encoding issues)
-        val candidatesWithLines = candidates.map { p =>
-          val lines = countLines(p)
-          val size = Files.size(p) / 1024
-          (p, lines, size)
-        }.filter { case (_, lines, size) => lines > 0 || size > 0 } // Keep files with lines OR size > 0
-        
-        if candidatesWithLines.isEmpty then
-          println("Error: No readable .txt files found. Specify --input <file.txt>")
-          sys.exit(1)
-        
-        val (recommended, other) = CliHelpers.classifyTrainingFiles(candidatesWithLines.map(_._1))
-        val orderedPaths = recommended ++ other
-        val byPath = candidatesWithLines.map { case (p, lines, size) => p -> (lines, size) }.toMap
+        inputFlag match
+          case Some(single) => Vector(Path.of(single))
+          case None         => Vector(selectTrainingInputInteractively())
 
-        println("Found text files (excluding chunks):")
-        if recommended.nonEmpty then println("  Recommended training files:")
-        recommended.zipWithIndex.foreach { case (p, idx) =>
-          val (lines, size) = byPath(p)
-          val linesStr = if lines > 0 then s"$lines lines" else "unknown lines"
-          println(s"    ${idx + 1}. $p ($linesStr, ${size} KB)")
-        }
-        if other.nonEmpty then println("  Other text files (likely derived; usually avoid):")
-        other.zipWithIndex.foreach { case (p, idx) =>
-          val (lines, size) = byPath(p)
-          val linesStr = if lines > 0 then s"$lines lines" else "unknown lines"
-          println(s"    ${recommended.length + idx + 1}. $p ($linesStr, ${size} KB)")
-        }
-        println()
-        
-        var selected: Option[Path] = None
-        while selected.isEmpty do
-          val raw = readTrimmedRequired(s"Choose file number [1]: ", "choose training file")
-          CliHelpers.parseMenuChoice(raw, optionCount = orderedPaths.length, defaultIndex = 0) match
-            case Some(idx) => selected = Some(orderedPaths(idx))
-            case None      => println(s"Please choose 1-${orderedPaths.length}.")
-        selected.get
+    require(inputPaths.nonEmpty, "No input files provided.")
+    inputPaths.foreach(p => require(Files.isRegularFile(p), s"Input file not found: $p"))
 
-    require(Files.isRegularFile(inputPath), s"Input file not found: $inputPath")
-
-    // Check if we can reuse existing model's architecture
     val existingCfg = if hasExistingModel && !actuallyFresh && Files.isRegularFile(ModelPath) then
       Some(CheckpointIO.load(ModelPath)._2)
     else
       None
 
-    // Get preset
-    val presetName = flags.get("preset").getOrElse {
+    val presetName = flags.getOrElse("preset", {
       println("\nChoose training quality:")
       presets.zipWithIndex.foreach { case (p, idx) =>
         println(s"  ${idx + 1}. ${p.name.capitalize} - ${p.description}")
@@ -201,11 +164,12 @@ object Main:
       val raw = readTrimmedRequired("\nSelect preset [2]: ", "select preset")
       val idx = CliHelpers.parseMenuChoice(raw, optionCount = presets.length, defaultIndex = 1).getOrElse(1)
       presets(idx).name
-    }
+    })
     val preset = presets.find(_.name == presetName).getOrElse {
       println(s"Unknown preset '$presetName'. Using 'balanced'.")
       presets(1)
     }
+
     val backend = BackendSelector.normalizeBackend(flags.getOrElse("backend", "gpu"))
     val precision = BackendSelector.normalizePrecision(flags.getOrElse("precision", defaultPrecisionForBackend(backend)))
     val learningRate = flags.get("lr").flatMap(_.toDoubleOption).getOrElse(preset.learningRate)
@@ -213,10 +177,18 @@ object Main:
     val batchSize = flags.get("batchSize").flatMap(_.toIntOption).getOrElse(0)
     val prefetch = flags.get("prefetch").flatMap(_.toIntOption).getOrElse(1)
     val profileGpu = flags.get("profileGpu").exists(CliHelpers.isTruthy)
+    val replayRatio = flags.get("replayRatio").flatMap(_.toDoubleOption).getOrElse(0.3)
+    val replayBufferSize = flags.get("replayBufferSize").flatMap(_.toIntOption).getOrElse(0)
+    val replayBufferPath = flags.get("replayBufferPath").map(Path.of(_))
+    val ewcLambda = flags.get("ewcLambda").flatMap(_.toDoubleOption).getOrElse(0.0)
+    val ewcSamples = flags.get("ewcSamples").flatMap(_.toIntOption).getOrElse(0)
     if flags.get("gpuInfo").exists(CliHelpers.isTruthy) then
       println(s"GPU info: ${BackendSelector.gpuInfo(precision)}")
 
-    // Get advanced options - use existing model's architecture if available
+    require(replayRatio >= 0.0 && replayRatio < 1.0, s"--replayRatio must be in [0,1), got $replayRatio")
+    require(replayBufferSize >= 0, s"--replayBufferSize must be >=0, got $replayBufferSize")
+    require(ewcLambda == 0.0, "--ewcLambda is not implemented yet. Keep it at 0.0 for now.")
+
     val contextSize = flags.get("contextSize").map(_.toInt).getOrElse {
       existingCfg match
         case Some(cfg) =>
@@ -236,73 +208,60 @@ object Main:
           raw.toIntOption.getOrElse(3000)
     }
 
-    // Ensure output directory exists
+    val inputWeights = parseInputWeights(flags.get("inputWeights"), inputPaths.length)
     Files.createDirectories(ModelPath.getParent)
 
-    // Show summary and confirm
     println(s"\n=== Summary ===")
-    println(s"  Input: $inputPath")
+    if inputPaths.length == 1 then println(s"  Input: ${inputPaths.head}")
+    else
+      println(s"  Inputs (${inputPaths.length}):")
+      inputPaths.zipWithIndex.foreach { case (p, idx) =>
+        println(f"    ${idx + 1}%2d. $p (weight=${inputWeights(idx)}%.3f)")
+      }
     println(s"  Preset: ${preset.name.capitalize} (${preset.epochs} epochs, patience=${preset.patience})")
     println(s"  Context size: $contextSize")
     println(s"  Max vocab: $maxVocab")
     println(s"  Backend: $backend ($precision)")
+    val replayFile = replayBufferPath.getOrElse(ReplayPath)
+    val replayLoadRequested = replayBufferPath.isDefined && Files.isRegularFile(replayFile)
+    val replayPersistenceEnabled = replayBufferSize > 0
+    val replayRequested = replayRatio > 0.0 && (inputPaths.length > 1 || replayLoadRequested || replayPersistenceEnabled)
     println(f"  Learning rate: $learningRate%.4f (decay=$lrDecay%.4f)")
+    if replayRequested || replayPersistenceEnabled then
+      val mode =
+        if replayPersistenceEnabled && replayLoadRequested then "load+persist"
+        else if replayPersistenceEnabled then "persist"
+        else if replayLoadRequested then "load-only"
+        else "phased-only"
+      println(f"  Replay: mode=$mode ratio=$replayRatio%.2f bufferSize=$replayBufferSize path=$replayFile")
+    else println("  Replay: disabled")
+    if ewcLambda > 0 then println(f"  EWC: enabled (lambda=$ewcLambda%.4f, samples=$ewcSamples)")
     if batchSize > 0 then println(s"  Batch size: $batchSize")
     if profileGpu then println("  GPU profile: enabled")
-    if actuallyFresh then
-      println(s"  🆕 Starting fresh model (new architecture)")
-    else if existingCfg.isDefined then
-      println(s"  ✓ Continuing from existing model")
-    else
-      println(s"  🆕 Starting fresh model")
+    if actuallyFresh then println(s"  🆕 Starting fresh model (new architecture)")
+    else if existingCfg.isDefined then println(s"  ✓ Continuing from existing model")
+    else println(s"  🆕 Starting fresh model")
     println()
 
     val autoConfirm = flags.get("yes").exists(CliHelpers.isTruthy)
     val confirm = if autoConfirm then
       println("Auto-confirming (--yes flag)")
       true
-    else
-      promptYesNo("Start training?", true)
-    
+    else promptYesNo("Start training?", true)
+
     if !confirm then
       println("Training canceled.")
       sys.exit(0)
 
     println()
 
-    // Load or create model - try multiple encodings
-    val rawText = 
-      try
-        Files.readString(inputPath, StandardCharsets.UTF_8)
-      catch
-        case _: Exception =>
-          println("UTF-8 read failed, trying with system default encoding...")
-          // Use BufferedReader with default charset which is more lenient
-          import java.io._
-          val reader = new BufferedReader(new InputStreamReader(Files.newInputStream(inputPath)))
-          try
-            val text = new StringBuilder
-            var line = reader.readLine()
-            while line != null do
-              text.append(line).append("\n")
-              line = reader.readLine()
-            text.toString
-          finally
-            reader.close()
-    val tokens = TextPipeline.tokenize(rawText)
-    
+    val tokenizedInputs = inputPaths.map(path => TextPipeline.tokenize(readTextRobust(path)))
     val vocab = if actuallyFresh || !Files.isRegularFile(VocabPath) then
-      TextPipeline.buildVocab(tokens, maxVocab)
+      TextPipeline.buildVocab(tokenizedInputs.flatten.toVector, maxVocab)
     else
       VocabIO.load(VocabPath)
 
-    val ids = TextPipeline.tokensToIds(tokens, vocab)
-    val examples = TextPipeline.buildExamples(ids, contextSize)
-    val (trainSet, valSet) = TextPipeline.splitDeterministic(examples, 0.9, 42)
-
-    require(trainSet.nonEmpty, "Training set is empty. Provide more text or reduce contextSize.")
-
-    val cfg = ModelConfig(
+    val modelCfg = ModelConfig(
       contextSize = contextSize,
       embedDim = preset.embedDim,
       hiddenDim = preset.hiddenDim,
@@ -311,12 +270,32 @@ object Main:
     )
 
     val params0 = if hasExistingModel && !actuallyFresh && Files.isRegularFile(ModelPath) then
-      val (existingParams, existingCfg) = CheckpointIO.load(ModelPath)
-      println(s"Loaded existing model (vocab: ${existingCfg.vocabSize} words, context: ${existingCfg.contextSize}, embed: ${existingCfg.embedDim}, hidden: ${existingCfg.hiddenDim})")
+      val (existingParams, cfg) = CheckpointIO.load(ModelPath)
+      println(s"Loaded existing model (vocab: ${cfg.vocabSize} words, context: ${cfg.contextSize}, embed: ${cfg.embedDim}, hidden: ${cfg.hiddenDim})")
       existingParams
     else
       println("Initializing new model...")
-      LanguageModel.initParams(cfg, 42)
+      LanguageModel.initParams(modelCfg, 42)
+
+    val phases = inputPaths.zipWithIndex.map { case (path, idx) =>
+      val ids = TextPipeline.tokensToIds(tokenizedInputs(idx), vocab)
+      val examples = TextPipeline.buildExamples(ids, contextSize)
+      val (trainSet, valSet) = TextPipeline.splitDeterministic(examples, 0.9, 42 + idx)
+      require(trainSet.nonEmpty, s"Training set is empty for $path. Provide more text or reduce contextSize.")
+      require(valSet.nonEmpty, s"Validation set is empty for $path. Provide more text or reduce contextSize.")
+      Trainer.TrainingPhase(path.getFileName.toString, trainSet, valSet, inputWeights(idx))
+    }.toVector
+
+    val vocabHash = vocab.idToToken.mkString("|").hashCode.toHexString
+    val replayState =
+      if replayPersistenceEnabled || replayLoadRequested then
+        if Files.isRegularFile(replayFile) then
+          Some(ReplayBuffer.load(replayFile, ReplayBuffer.Expected(contextSize, vocab.size, vocabHash)))
+        else if replayPersistenceEnabled then
+          Some(ReplayBuffer.initialize(contextSize, vocab.size, vocabHash))
+        else
+          throw new IllegalArgumentException(s"Replay buffer file not found for --replayBufferPath: $replayFile")
+      else None
 
     val trainCfg = TrainConfig(
       epochs = preset.epochs,
@@ -332,16 +311,32 @@ object Main:
       precision = precision,
       batchSize = batchSize,
       prefetch = prefetch,
-      profileGpu = profileGpu
+      profileGpu = profileGpu,
+      inputWeights = inputWeights,
+      replayRatio = replayRatio,
+      replayBufferSize = replayBufferSize,
+      replayBufferPath = replayBufferPath.map(_.toString),
+      domainLabels = phases.map(_.label),
+      mixedValWeights = inputWeights,
+      ewcLambda = ewcLambda,
+      ewcSamples = ewcSamples
     )
 
-    // Train
-    val result = Trainer.train(params0, trainSet, valSet, trainCfg)
+    val usePhasedTraining =
+      phases.length > 1 || replayRatio > 0.0 || replayState.nonEmpty || replayPersistenceEnabled
+
+    val result =
+      if usePhasedTraining then
+        Trainer.trainPhased(params0, phases, trainCfg, replayState)
+      else
+        Trainer.train(params0, phases.head.trainSet, phases.head.valSet, trainCfg)
 
     val shouldSave = result.saveDecision != SaveDecision.Discard
     if shouldSave then
-      CheckpointIO.save(result.params, cfg, ModelPath)
+      CheckpointIO.save(result.params, modelCfg, ModelPath)
       VocabIO.save(vocab, VocabPath)
+      if replayPersistenceEnabled then
+        result.replayBuffer.foreach(_.save(replayFile))
 
     println("\n=== Results ===")
     val bestMetric = result.history.minBy(_.valLoss)
@@ -358,23 +353,93 @@ object Main:
         case _                                               => ""
     result.history.foreach { m =>
       val indicator = if m.epoch == bestMetric.epoch then " ← best" else ""
+      val phaseTag = m.phaseLabel.map(p => s" phase=$p").getOrElse("")
       println(
-        f"  Epoch ${m.epoch}%2d: train=${m.trainLoss}%.4f val=${m.valLoss}%.4f ppl=${m.valPerplexity}%.1f status=${m.status.toString.toLowerCase}(${m.statusReason}) gap=${m.generalizationGap}%.3f delta=${m.bestDeltaPct}%.2f%%$indicator"
+        f"  Epoch ${m.epoch}%2d:$phaseTag train=${m.trainLoss}%.4f val=${m.valLoss}%.4f ppl=${m.valPerplexity}%.1f status=${m.status.toString.toLowerCase}(${m.statusReason}) gap=${m.generalizationGap}%.3f delta=${m.bestDeltaPct}%.2f%%$indicator"
       )
+      if m.perDomainValMetrics.nonEmpty then
+        println("    per-domain: " + m.perDomainValMetrics.map(dm => f"${dm.domain}:${dm.valLoss}%.4f/${dm.valPerplexity}%.2f").mkString(", "))
+      if m.retentionMetrics.nonEmpty then
+        println("    retention:  " + m.retentionMetrics.map(r => f"${r.domain}:${r.retentionPct}%.1f%%(${r.status})").mkString(", "))
     }
 
     if shouldSave then
       println(s"\n✓ Model saved to $ModelPath")
       println(s"  Vocab saved to $VocabPath")
+      if replayPersistenceEnabled then println(s"  Replay saved to $replayFile")
     else
-      println("\nTraining output discarded; checkpoint and vocab were not saved.")
+      println("\nTraining output discarded; checkpoint, vocab, and replay were not saved.")
     println(f"  Final$restoredNote: val_loss=${finalMetric.valLoss}%.4f val_ppl=${finalMetric.valPerplexity}%.1f")
     if trainCfg.patience > 0 && result.history.nonEmpty then
       val last = result.history.last
       println(f"  Last epoch (pre-restore): val_loss=${last.valLoss}%.4f val_ppl=${last.valPerplexity}%.1f")
     println()
-    println("Continue with: sbt \"run train --input <more-data.txt>\"")
+    println("Continue with: sbt \"run train --inputs <more1.txt,more2.txt>\"")
     println("Or predict:    sbt \"run predict --context 'your text'\"")
+
+  private def selectTrainingInputInteractively(): Path =
+    val candidates = discoverTextFiles(Path.of(".").toAbsolutePath.normalize, maxDepth = 6)
+      .filter(p => !p.toString.contains("/chunks/"))
+    val candidatesWithLines = candidates.map { p =>
+      val lines = countLines(p)
+      val size = Files.size(p) / 1024
+      (p, lines, size)
+    }.filter { case (_, lines, size) => lines > 0 || size > 0 }
+    if candidatesWithLines.isEmpty then
+      println("Error: No readable .txt files found. Specify --input <file.txt> or --inputs <a,b,c>")
+      sys.exit(1)
+    val (recommended, other) = CliHelpers.classifyTrainingFiles(candidatesWithLines.map(_._1))
+    val orderedPaths = recommended ++ other
+    val byPath = candidatesWithLines.map { case (p, lines, size) => p -> (lines, size) }.toMap
+    println("Found text files (excluding chunks):")
+    if recommended.nonEmpty then println("  Recommended training files:")
+    recommended.zipWithIndex.foreach { case (p, idx) =>
+      val (lines, size) = byPath(p)
+      val linesStr = if lines > 0 then s"$lines lines" else "unknown lines"
+      println(s"    ${idx + 1}. $p ($linesStr, ${size} KB)")
+    }
+    if other.nonEmpty then println("  Other text files (likely derived; usually avoid):")
+    other.zipWithIndex.foreach { case (p, idx) =>
+      val (lines, size) = byPath(p)
+      val linesStr = if lines > 0 then s"$lines lines" else "unknown lines"
+      println(s"    ${recommended.length + idx + 1}. $p ($linesStr, ${size} KB)")
+    }
+    println()
+    var selected: Option[Path] = None
+    while selected.isEmpty do
+      val raw = readTrimmedRequired(s"Choose file number [1]: ", "choose training file")
+      CliHelpers.parseMenuChoice(raw, optionCount = orderedPaths.length, defaultIndex = 0) match
+        case Some(idx) => selected = Some(orderedPaths(idx))
+        case None      => println(s"Please choose 1-${orderedPaths.length}.")
+    selected.get
+
+  private def parseInputWeights(raw: Option[String], count: Int): Vector[Double] =
+    require(count >= 1, "at least one input is required")
+    raw match
+      case None => Vector.fill(count)(1.0 / count.toDouble)
+      case Some(csv) =>
+        val values = csv.split(",").toVector.map(_.trim).filter(_.nonEmpty).map(_.toDouble)
+        require(values.length == count, s"--inputWeights count (${values.length}) must match number of inputs ($count)")
+        val clamped = values.map(v => if v.isFinite && v > 0 then v else 0.0)
+        val sum = clamped.sum
+        require(sum > 0, "--inputWeights must include at least one positive value")
+        clamped.map(_ / sum)
+
+  private def readTextRobust(path: Path): String =
+    try Files.readString(path, StandardCharsets.UTF_8)
+    catch
+      case _: Exception =>
+        println(s"UTF-8 read failed for $path, trying with system default encoding...")
+        import java.io._
+        val reader = new BufferedReader(new InputStreamReader(Files.newInputStream(path)))
+        try
+          val text = new StringBuilder
+          var line = reader.readLine()
+          while line != null do
+            text.append(line).append("\n")
+            line = reader.readLine()
+          text.toString
+        finally reader.close()
 
   private def runChunker(flags: Map[String, String]): Unit =
     println("\n=== File Chunker ===\n")
@@ -437,9 +502,7 @@ object Main:
     Files.createDirectories(outputDir)
 
     // Get base name for chunks
-    val baseName = flags.get("name").getOrElse {
-      inputPath.getFileName.toString.replace(".txt", "")
-    }
+    val baseName = flags.getOrElse("name", inputPath.getFileName.toString.replace(".txt", ""))
 
     println(s"\nChunking plan:")
     println(s"  Input: $inputPath (${totalLines} lines)")
@@ -685,7 +748,9 @@ object Main:
         |  sbt "runMain app.Main benchmark"    Compare CPU/GPU throughput estimate
         |
         |Training:
-        |  --input FILE      Training text file (required)
+        |  --input FILE      Training text file (single-input mode)
+        |  --inputs CSV      Multiple training files (e.g., a.txt,b.txt)
+        |  --inputWeights CSV Optional per-input weights (normalized)
         |  --preset NAME     quick/balanced/thorough (default: balanced)
         |  --fresh           Start fresh (ignore existing model)
         |  --contextSize N   Words to look back (default: 3)
@@ -698,6 +763,11 @@ object Main:
         |  --prefetch N      Prefetch window (1 or 2; default: 1)
         |  --profileGpu      Print per-op GPU profile summary after training
         |  --gpuInfo         Print GPU probe details before training
+        |  --replayRatio V   Replay mix ratio in [0,1) (default: 0.3)
+        |  --replayBufferSize N Replay memory size (0 disables persistence)
+        |  --replayBufferPath FILE Optional replay file path
+        |  --ewcLambda V     Optional EWC regularization strength (default: 0)
+        |  --ewcSamples N    Optional EWC sample count
         |
         |Chunking:
         |  --input FILE      File to split (required, or select interactively)
@@ -725,7 +795,7 @@ object Main:
         |
         |Examples:
         |  sbt "runMain app.Main train --input data/corpus/text.txt"
-        |  sbt "runMain app.Main train --input more.txt --preset quick"
+        |  sbt "runMain app.Main train --inputs data/a.txt,data/b.txt --inputWeights 0.7,0.3 --replayRatio 0.3 --replayBufferSize 10000"
         |  sbt "runMain app.Main chunk --input large-file.txt --lines 1000"
         |  sbt "runMain app.Main predict --context 'the cat sat' --topK 5"
         |""".stripMargin)

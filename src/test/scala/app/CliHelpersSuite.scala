@@ -57,6 +57,24 @@ class CliHelpersSuite extends FunSuite:
     assertEquals(got.get("yes"), Some("true"))
   }
 
+  test("parseArgs supports replay and multi-input flags") {
+    val args = Array(
+      "--inputs",
+      "a.txt,b.txt",
+      "--inputWeights",
+      "0.7,0.3",
+      "--replayRatio",
+      "0.3",
+      "--replayBufferSize",
+      "5000"
+    )
+    val got = CliHelpers.parseArgs(args)
+    assertEquals(got.get("inputs"), Some("a.txt,b.txt"))
+    assertEquals(got.get("inputWeights"), Some("0.7,0.3"))
+    assertEquals(got.get("replayRatio"), Some("0.3"))
+    assertEquals(got.get("replayBufferSize"), Some("5000"))
+  }
+
   test("parseArgs uses last-wins for repeated flags") {
     val args = Array("--yes", "false", "--yes", "--backend", "cpu", "--backend", "gpu")
     val got = CliHelpers.parseArgs(args)

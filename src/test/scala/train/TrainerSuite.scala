@@ -111,3 +111,33 @@ class TrainerSuite extends FunSuite:
     val got = Trainer.resolveInterruptDecision(interactive = true, _ => inputs.dequeue())
     assertEquals(got, SaveDecision.SaveCurrent)
   }
+
+  test("trainPhased reports per-domain metrics and keeps mixed val aliases populated") {
+    val p0 = LanguageModel.initParams(cfg, seed = 40)
+    val phaseA = Trainer.TrainingPhase(
+      label = "a.txt",
+      trainSet = Vector.fill(24)(Example(Vector(1, 2), 3)),
+      valSet = Vector.fill(8)(Example(Vector(1, 2), 3)),
+      weight = 0.6
+    )
+    val phaseB = Trainer.TrainingPhase(
+      label = "b.txt",
+      trainSet = Vector.fill(24)(Example(Vector(2, 3), 4)),
+      valSet = Vector.fill(8)(Example(Vector(2, 3), 4)),
+      weight = 0.4
+    )
+
+    val result = Trainer.trainPhased(
+      p0,
+      phases = Vector(phaseA, phaseB),
+      cfg = TrainConfig(epochs = 2, learningRate = 0.05, seed = 40, backend = "cpu", replayRatio = 0.2, replayBufferSize = 100)
+    )
+
+    assert(result.history.nonEmpty)
+    val last = result.history.last
+    assert(last.perDomainValMetrics.nonEmpty)
+    assert(last.valLoss.isFinite)
+    assert(last.valPerplexity.isFinite)
+    assert(last.mixedValLoss.isFinite)
+    assert(result.replayBuffer.exists(_.examples.nonEmpty))
+  }

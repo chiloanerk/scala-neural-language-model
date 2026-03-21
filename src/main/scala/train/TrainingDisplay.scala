@@ -19,6 +19,23 @@ trait TrainingDisplay:
   def onTrainingComplete(interrupted: Boolean): Unit
 
 object TrainingDisplay:
+  private[train] def metricSummary(metrics: EpochMetrics): String =
+    val perDomain =
+      if metrics.perDomainValMetrics.isEmpty then ""
+      else
+        val rendered = metrics.perDomainValMetrics
+          .map(m => f"${m.domain}:${m.valLoss}%.4f/${m.valPerplexity}%.2f")
+          .mkString(", ")
+        s" | domains=[$rendered]"
+    val retention =
+      if metrics.retentionMetrics.isEmpty then ""
+      else
+        val rendered = metrics.retentionMetrics
+          .map(m => f"${m.domain}:${m.retentionPct}%.1f%%(${m.status})")
+          .mkString(", ")
+        s" | retention=[$rendered]"
+    perDomain + retention
+
   def isInteractiveTerminal: Boolean =
     val forceRaw = Option(System.getenv("TRAIN_PROGRESS_FORCE_TTY")).map(_.trim.toLowerCase)
     val forceOn = forceRaw.exists(v => Set("1", "true", "yes", "on").contains(v))
@@ -54,8 +71,9 @@ final class PlainLogDisplay(log: String => Unit = s => println(s)) extends Train
     val bestMarker = if isBest then " | best" else ""
     val patienceInfo = if patience > 0 then s" | patience=${patienceCounter}/${patience}" else ""
     val detail = f"delta=${metrics.bestDeltaPct}%.2f%% gap=${metrics.generalizationGap}%.3f"
+    val extras = TrainingDisplay.metricSummary(metrics)
     log(
-      f"  Epoch ${metrics.epoch}%2d done in ${metrics.epochSeconds}%.1fs | train=${metrics.trainLoss}%.4f val=${metrics.valLoss}%.4f ppl=${metrics.valPerplexity}%.2f | ${metrics.status}: ${metrics.statusReason} | $detail$bestMarker$patienceInfo"
+      f"  Epoch ${metrics.epoch}%2d done in ${metrics.epochSeconds}%.1fs | train=${metrics.trainLoss}%.4f val=${metrics.valLoss}%.4f ppl=${metrics.valPerplexity}%.2f | ${metrics.status}: ${metrics.statusReason} | $detail$bestMarker$patienceInfo$extras"
     )
 
   override def onCancellationRequested(epoch: Int): Unit =
@@ -93,8 +111,9 @@ final class AnsiEpochBoardDisplay(
     val bestMarker = if isBest then " | best" else ""
     val patienceInfo = if patience > 0 then s" | patience=${patienceCounter}/${patience}" else ""
     val detail = f"delta=${metrics.bestDeltaPct}%.2f%% gap=${metrics.generalizationGap}%.3f"
+    val extras = TrainingDisplay.metricSummary(metrics)
     val finalLine =
-      f"Epoch ${metrics.epoch}%2d done ${metrics.epochSeconds}%.1fs | train=${metrics.trainLoss}%.4f val=${metrics.valLoss}%.4f ppl=${metrics.valPerplexity}%.2f | ${metrics.status}: ${metrics.statusReason} | $detail$bestMarker$patienceInfo"
+      f"Epoch ${metrics.epoch}%2d done ${metrics.epochSeconds}%.1fs | train=${metrics.trainLoss}%.4f val=${metrics.valLoss}%.4f ppl=${metrics.valPerplexity}%.2f | ${metrics.status}: ${metrics.statusReason} | $detail$bestMarker$patienceInfo$extras"
     write(s"\r$clearLine$finalLine\n")
     liveLineOpen = false
 

@@ -4,6 +4,7 @@ import compute.{BackendSelector, ComputeBackend}
 import data.Example
 import eval.Metrics
 import nn.{LanguageModel, Params}
+
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 import scala.util.Random
 import scala.util.control.NonFatal
@@ -15,6 +16,21 @@ enum TrainingStatus:
 enum SaveDecision:
   case SaveBest, SaveCurrent, Discard
 
+final case class DomainValMetrics(
+    domain: String,
+    valLoss: Double,
+    valPerplexity: Double,
+    weight: Double
+)
+
+final case class RetentionMetrics(
+    domain: String,
+    baselineValLoss: Double,
+    currentValLoss: Double,
+    retentionPct: Double,
+    status: String
+)
+
 final case class TrainConfig(
     epochs: Int = 10,
     learningRate: Double = 0.05,
@@ -23,13 +39,21 @@ final case class TrainConfig(
     clipNorm: Option[Double] = None,
     shuffleEachEpoch: Boolean = true,
     seed: Int = 42,
-    patience: Int = 0,  // 0 = disabled, >0 = early stopping enabled
+    patience: Int = 0,
     activation: String = "tanh",
     backend: String = "gpu",
     precision: String = "fp64",
     batchSize: Int = 0,
     prefetch: Int = 1,
-    profileGpu: Boolean = false
+    profileGpu: Boolean = false,
+    inputWeights: Vector[Double] = Vector.empty,
+    replayRatio: Double = 0.0,
+    replayBufferSize: Int = 0,
+    replayBufferPath: Option[String] = None,
+    domainLabels: Vector[String] = Vector.empty,
+    mixedValWeights: Vector[Double] = Vector.empty,
+    ewcLambda: Double = 0.0,
+    ewcSamples: Int = 0
 )
 
 final case class EpochMetrics(
@@ -43,16 +67,29 @@ final case class EpochMetrics(
     status: TrainingStatus = TrainingStatus.Stalled,
     statusReason: String = "n/a",
     bestDeltaPct: Double = 0.0,
-    generalizationGap: Double = 0.0
+    generalizationGap: Double = 0.0,
+    mixedValLoss: Double = Double.NaN,
+    perDomainValMetrics: Vector[DomainValMetrics] = Vector.empty,
+    retentionMetrics: Vector[RetentionMetrics] = Vector.empty,
+    phaseLabel: Option[String] = None
 )
+
 final case class TrainResult(
     params: Params,
     history: Vector[EpochMetrics],
     interrupted: Boolean = false,
-    saveDecision: SaveDecision = SaveDecision.SaveCurrent
+    saveDecision: SaveDecision = SaveDecision.SaveCurrent,
+    replayBuffer: Option[ReplayBuffer] = None
 )
 
 object Trainer:
+
+  final case class TrainingPhase(
+      label: String,
+      trainSet: Vector[Example],
+      valSet: Vector[Example],
+      weight: Double
+  )
 
   private[train] final case class Trajectory(
       status: TrainingStatus,
@@ -62,7 +99,6 @@ object Trainer:
       valTrend3: Double
   )
 
-  // Progress bar helper (package-private for testing)
   private[train] def createProgressBar(percent: Int, width: Int = 20): String =
     val clamped = math.max(0, math.min(100, percent))
     val filled = (clamped * width) / 100
@@ -81,8 +117,7 @@ object Trainer:
 
     val trendSeries = history.takeRight(2).map(_.valLoss) :+ valLoss
     val valTrend3 =
-      if trendSeries.length >= 3 then
-        (trendSeries.last - trendSeries.head) / (trendSeries.length - 1).toDouble
+      if trendSeries.length >= 3 then (trendSeries.last - trendSeries.head) / (trendSeries.length - 1).toDouble
       else 0.0
 
     val prevGap = history.lastOption.map(_.generalizationGap)
@@ -152,10 +187,25 @@ object Trainer:
     }
 
   def train(initial: Params, trainSet: Vector[Example], valSet: Vector[Example], cfg: TrainConfig): TrainResult =
+    val phase = TrainingPhase("domain-1", trainSet, valSet, weight = 1.0)
+    trainPhased(initial, Vector(phase), cfg.copy(replayRatio = 0.0, replayBufferSize = 0), replayBuffer = None)
+      .copy(replayBuffer = None)
+
+  def trainPhased(
+      initial: Params,
+      phases: Vector[TrainingPhase],
+      cfg: TrainConfig,
+      replayBuffer: Option[ReplayBuffer] = None
+  ): TrainResult =
+    require(phases.nonEmpty, "phases cannot be empty")
+    require(phases.forall(_.trainSet.nonEmpty), "all phase train sets must be non-empty")
+    require(phases.forall(_.valSet.nonEmpty), "all phase validation sets must be non-empty")
     require(cfg.epochs >= 1, s"epochs must be >= 1, got ${cfg.epochs}")
     require(cfg.learningRate > 0.0, s"learningRate must be > 0, got ${cfg.learningRate}")
     require(cfg.lrDecay > 0.0, s"lrDecay must be > 0, got ${cfg.lrDecay}")
     require(cfg.patience >= 0, s"patience must be >= 0, got ${cfg.patience}")
+    require(cfg.replayRatio >= 0.0 && cfg.replayRatio < 1.0, s"replayRatio must be in [0,1), got ${cfg.replayRatio}")
+    require(cfg.replayBufferSize >= 0, s"replayBufferSize must be >= 0, got ${cfg.replayBufferSize}")
 
     val display = TrainingDisplay.create()
     val interactive = TrainingDisplay.isInteractiveTerminal
@@ -167,159 +217,231 @@ object Trainer:
       println(s"GPU ops enabled: $ops")
     backend.resetProfile()
 
+    val weights = normalizedWeights(phases.map(_.weight))
+    val weightedPhases = phases.zip(weights).map { case (p, w) => p.copy(weight = w) }
+
     var params = initial
     var lr = cfg.learningRate
     var history = Vector.empty[EpochMetrics]
 
-    // Early stopping state
     var bestParams = initial
     var bestValLoss = Double.MaxValue
     var bestEpoch = 0
     var patienceCounter = 0
+
+    var buffer = replayBuffer
 
     val cancelRequested = AtomicBoolean(false)
     val currentEpoch = AtomicInteger(0)
     val previousSignalHandler = installInterruptHandler(cancelRequested, currentEpoch, display)
 
     try
-      val totalExamples = trainSet.length
-      val effectiveBatchSize =
-        if cfg.batchSize > 0 then cfg.batchSize
-        else if backend.isGpu then 128 else 32
-      println(s"Batch size: $effectiveBatchSize")
-      // Show progress every ~10 checkpoints per epoch, but not too chatty on small sets
-      val progressInterval = math.max(100, math.max(1, totalExamples / 10))
-      val estimateSec = estimateEpochSeconds(params, trainSet, cfg, backend)
-      display.onTrainingStart(estimateSec)
+      val defaultBatchSize = if cfg.batchSize > 0 then cfg.batchSize else if backend.isGpu then 128 else 32
+      println(s"Batch size: $defaultBatchSize")
 
-      var epoch = 1
+      val phaseEstimate = weightedPhases.map(p => estimateEpochSeconds(params, p.trainSet, cfg, backend)).sum / weightedPhases.length.toDouble
+      display.onTrainingStart(phaseEstimate)
+
+      val totalEpochsPlanned = cfg.epochs * weightedPhases.length
+      var globalEpoch = 1
       var stopTraining = false
       var interrupted = false
       var saveDecision = SaveDecision.SaveCurrent
 
-      while epoch <= cfg.epochs && !stopTraining do
-        currentEpoch.set(epoch)
-        display.onEpochStart(epoch, cfg.epochs, lr, totalExamples)
+      var phaseIndex = 0
+      while phaseIndex < weightedPhases.length && !stopTraining do
+        val phase = weightedPhases(phaseIndex)
+        println(s"\nPhase ${phaseIndex + 1}/${weightedPhases.length}: ${phase.label}")
 
-        val startTime = System.currentTimeMillis()
-        val rnd = Random(cfg.seed + epoch)
-        val epochData = if cfg.shuffleEachEpoch then rnd.shuffle(trainSet) else trainSet
-        val batches = epochData.grouped(effectiveBatchSize).toVector
+        val seenPhases = weightedPhases.take(phaseIndex + 1)
+        val oldPhases = weightedPhases.take(phaseIndex)
+        val retentionBaselines =
+          oldPhases.map { p =>
+            val baseline = Metrics.meanLoss(params, p.valSet, cfg.activation, backend, batchSize = defaultBatchSize)
+            p.label -> baseline
+          }.toMap
 
-        var lossSum = 0.0
-        var seen = 0
-        var nextReportAt = progressInterval
-        var batchIndex = 0
+        var phaseEpoch = 1
+        while phaseEpoch <= cfg.epochs && !stopTraining do
+          currentEpoch.set(globalEpoch)
 
-        while batchIndex < batches.length && !stopTraining do
-          val batch = batches(batchIndex)
-          val (updated, loss) = LanguageModel.trainBatchStep(
-            params,
-            batch,
-            lr,
-            l2 = cfg.l2,
-            clipNorm = cfg.clipNorm,
-            activation = cfg.activation,
-            backend = backend
+          val replayExamples = buildReplaySlice(
+            currentTrainSize = phase.trainSet.length,
+            replayRatio = cfg.replayRatio,
+            seed = cfg.seed + globalEpoch,
+            buffer = buffer
           )
-          params = updated
-          lossSum += loss * batch.size
-          seen += batch.size
 
-          if seen >= nextReportAt || seen == totalExamples || cancelRequested.get() then
-            val elapsed = (System.currentTimeMillis() - startTime) / 1000.0
-            val progress = if totalExamples <= 0 then 100 else ((seen.toDouble / totalExamples) * 100).toInt
-            val avgLoss = if seen == 0 then 0.0 else lossSum / seen
-            val examplesPerSec = if elapsed > 0 then seen.toDouble / elapsed else 0.0
-            val estimatedTotal = if examplesPerSec > 0 then totalExamples.toDouble / examplesPerSec else 0.0
-            val remaining = math.max(0.0, estimatedTotal - elapsed)
-            display.onBatchProgress(
-              BatchProgress(
-                epoch = epoch,
-                totalEpochs = cfg.epochs,
-                percent = progress,
-                elapsedSec = elapsed,
-                remainingSec = remaining,
-                examplesPerSec = examplesPerSec,
-                avgLoss = avgLoss
-              )
+          val combinedTrainSet =
+            if replayExamples.isEmpty then phase.trainSet
+            else phase.trainSet ++ replayExamples
+
+          val epochData =
+            if cfg.shuffleEachEpoch then Random(cfg.seed + globalEpoch).shuffle(combinedTrainSet)
+            else combinedTrainSet
+
+          val totalExamples = epochData.length
+          val progressInterval = math.max(100, math.max(1, totalExamples / 10))
+          display.onEpochStart(globalEpoch, totalEpochsPlanned, lr, totalExamples)
+
+          val startTime = System.currentTimeMillis()
+          val batches = epochData.grouped(defaultBatchSize).toVector
+
+          var lossSum = 0.0
+          var seen = 0
+          var nextReportAt = progressInterval
+          var batchIndex = 0
+
+          while batchIndex < batches.length && !stopTraining do
+            val batch = batches(batchIndex)
+            val (updated, loss) = LanguageModel.trainBatchStep(
+              params,
+              batch,
+              lr,
+              l2 = cfg.l2,
+              clipNorm = cfg.clipNorm,
+              activation = cfg.activation,
+              backend = backend
             )
-            while nextReportAt <= seen do
-              nextReportAt += progressInterval
+            params = updated
+            lossSum += loss * batch.size
+            seen += batch.size
 
-          if cancelRequested.get() then
-            interrupted = true
-            stopTraining = true
+            if seen >= nextReportAt || seen == totalExamples || cancelRequested.get() then
+              val elapsed = (System.currentTimeMillis() - startTime) / 1000.0
+              val progress = if totalExamples <= 0 then 100 else ((seen.toDouble / totalExamples) * 100).toInt
+              val avgLoss = if seen == 0 then 0.0 else lossSum / seen
+              val examplesPerSec = if elapsed > 0 then seen.toDouble / elapsed else 0.0
+              val estimatedTotal = if examplesPerSec > 0 then totalExamples.toDouble / examplesPerSec else 0.0
+              val remaining = math.max(0.0, estimatedTotal - elapsed)
 
-          batchIndex += 1
+              display.onBatchProgress(
+                BatchProgress(
+                  epoch = globalEpoch,
+                  totalEpochs = totalEpochsPlanned,
+                  percent = progress,
+                  elapsedSec = elapsed,
+                  remainingSec = remaining,
+                  examplesPerSec = examplesPerSec,
+                  avgLoss = avgLoss
+                )
+              )
 
-        val trainLoss = if seen == 0 then 0.0 else lossSum / seen.toDouble
-        val epochTime = (System.currentTimeMillis() - startTime) / 1000.0
+              while nextReportAt <= seen do
+                nextReportAt += progressInterval
 
-        val valLoss = Metrics.meanLoss(params, valSet, cfg.activation, backend, batchSize = effectiveBatchSize)
-        val ppl = Metrics.perplexity(valLoss)
-
-        val trajectory = classifyTrajectory(history, trainLoss, valLoss)
-        val examplesPerSec = if epochTime > 0 then seen.toDouble / epochTime else 0.0
-
-        val metrics = EpochMetrics(
-          epoch = epoch,
-          trainLoss = trainLoss,
-          valLoss = valLoss,
-          valPerplexity = ppl,
-          learningRate = lr,
-          epochSeconds = epochTime,
-          examplesPerSec = examplesPerSec,
-          status = trajectory.status,
-          statusReason = trajectory.reason,
-          bestDeltaPct = trajectory.bestDeltaPct,
-          generalizationGap = trajectory.generalizationGap
-        )
-
-        history :+= metrics
-
-        var isBest = false
-        var earlyStopMessage: Option[String] = None
-        if cfg.patience > 0 then
-          if valLoss < bestValLoss then
-            bestValLoss = valLoss
-            bestParams = params
-            bestEpoch = epoch
-            patienceCounter = 0
-            isBest = true
-          else
-            patienceCounter += 1
-            if patienceCounter >= cfg.patience then
-              earlyStopMessage = Some(f"Early stopping triggered at epoch $epoch (best: epoch $bestEpoch)")
+            if cancelRequested.get() then
+              interrupted = true
               stopTraining = true
-        else
-          bestParams = params // No early stopping, keep latest
-          bestValLoss = valLoss
-          bestEpoch = epoch
 
-        display.onEpochComplete(metrics, isBest = isBest, patienceCounter = patienceCounter, patience = cfg.patience)
-        earlyStopMessage.foreach(println)
+            batchIndex += 1
 
-        if interrupted then
-          saveDecision = resolveInterruptDecision(interactive)
-          saveDecision match
-            case SaveDecision.SaveBest =>
-              if bestEpoch == 0 then
-                bestParams = params
-                bestEpoch = epoch
-            case SaveDecision.SaveCurrent =>
+          val trainLoss = if seen == 0 then 0.0 else lossSum / seen.toDouble
+          val epochTime = (System.currentTimeMillis() - startTime) / 1000.0
+          val examplesPerSec = if epochTime > 0 then seen.toDouble / epochTime else 0.0
+
+          val domainMetrics = seenPhases.map { p =>
+            val loss = Metrics.meanLoss(params, p.valSet, cfg.activation, backend, batchSize = defaultBatchSize)
+            DomainValMetrics(
+              domain = p.label,
+              valLoss = loss,
+              valPerplexity = Metrics.perplexity(loss),
+              weight = p.weight
+            )
+          }
+
+          val mixedValLoss = weightedLoss(domainMetrics)
+          val mixedPpl = Metrics.perplexity(mixedValLoss)
+
+          val retention = oldPhases.flatMap { p =>
+            retentionBaselines.get(p.label).zip(domainMetrics.find(_.domain == p.label)).map { case (baseline, current) =>
+              val ratio = if current.valLoss <= 0 then 1.0 else baseline / current.valLoss
+              val retentionPct = ratio * 100.0
+              val band =
+                if retentionPct >= 95.0 then "retained"
+                else if retentionPct >= 80.0 then "warning"
+                else "significant forgetting"
+              RetentionMetrics(
+                domain = p.label,
+                baselineValLoss = baseline,
+                currentValLoss = current.valLoss,
+                retentionPct = retentionPct,
+                status = band
+              )
+            }
+          }
+
+          val trajectory = classifyTrajectory(history, trainLoss, mixedValLoss)
+          val metrics = EpochMetrics(
+            epoch = globalEpoch,
+            trainLoss = trainLoss,
+            valLoss = mixedValLoss,
+            valPerplexity = mixedPpl,
+            learningRate = lr,
+            epochSeconds = epochTime,
+            examplesPerSec = examplesPerSec,
+            status = trajectory.status,
+            statusReason = trajectory.reason,
+            bestDeltaPct = trajectory.bestDeltaPct,
+            generalizationGap = trajectory.generalizationGap,
+            mixedValLoss = mixedValLoss,
+            perDomainValMetrics = domainMetrics,
+            retentionMetrics = retention,
+            phaseLabel = Some(phase.label)
+          )
+
+          history :+= metrics
+
+          var isBest = false
+          var earlyStopMessage: Option[String] = None
+          if cfg.patience > 0 then
+            if mixedValLoss < bestValLoss then
+              bestValLoss = mixedValLoss
               bestParams = params
-            case SaveDecision.Discard =>
-              ()
-        else
-          lr *= cfg.lrDecay
-          epoch += 1
+              bestEpoch = globalEpoch
+              patienceCounter = 0
+              isBest = true
+            else
+              patienceCounter += 1
+              if patienceCounter >= cfg.patience then
+                earlyStopMessage = Some(f"Early stopping triggered at epoch $globalEpoch (best: epoch $bestEpoch)")
+                stopTraining = true
+          else
+            bestParams = params
+            bestValLoss = mixedValLoss
+            bestEpoch = globalEpoch
+
+          display.onEpochComplete(metrics, isBest = isBest, patienceCounter = patienceCounter, patience = cfg.patience)
+          earlyStopMessage.foreach(println)
+
+          if interrupted then
+            saveDecision = resolveInterruptDecision(interactive)
+            saveDecision match
+              case SaveDecision.SaveBest =>
+                if bestEpoch == 0 then
+                  bestParams = params
+                  bestEpoch = globalEpoch
+              case SaveDecision.SaveCurrent =>
+                bestParams = params
+              case SaveDecision.Discard => ()
+          else
+            lr *= cfg.lrDecay
+            globalEpoch += 1
+            phaseEpoch += 1
+        if cfg.replayBufferSize > 0 && phase.trainSet.nonEmpty then
+          buffer = Some(
+            buffer match
+              case Some(existing) => existing.add(phase.trainSet, phase.label, cfg.replayBufferSize)
+              case None           => ReplayBuffer.empty.add(phase.trainSet, phase.label, cfg.replayBufferSize)
+          )
+
+        phaseIndex += 1
 
       if !interrupted then
         saveDecision = if cfg.patience > 0 then SaveDecision.SaveBest else SaveDecision.SaveCurrent
 
       if cfg.patience > 0 && bestEpoch > 0 && bestEpoch < history.length && saveDecision == SaveDecision.SaveBest then
-        println(f"Restoring best model from epoch $bestEpoch (val_loss=$bestValLoss%.6f)")
+        println(f"Restoring best model from epoch $bestEpoch (mixed_val_loss=$bestValLoss%.6f)")
 
       display.onTrainingComplete(interrupted)
       if cfg.profileGpu && backend.isGpu then
@@ -330,9 +452,45 @@ object Trainer:
         case SaveDecision.SaveBest    => bestParams
         case SaveDecision.Discard     => params
 
-      TrainResult(params = finalParams, history = history, interrupted = interrupted, saveDecision = saveDecision)
+      TrainResult(
+        params = finalParams,
+        history = history,
+        interrupted = interrupted,
+        saveDecision = saveDecision,
+        replayBuffer = buffer
+      )
     finally
       restoreInterruptHandler(previousSignalHandler)
+
+  private def weightedLoss(metrics: Vector[DomainValMetrics]): Double =
+    if metrics.isEmpty then 0.0
+    else
+      val sumW = metrics.map(_.weight).sum
+      if sumW <= 0 then metrics.map(_.valLoss).sum / metrics.length.toDouble
+      else metrics.map(m => m.valLoss * m.weight).sum / sumW
+
+  private def normalizedWeights(raw: Vector[Double]): Vector[Double] =
+    if raw.isEmpty then Vector.empty
+    else
+      val clamped = raw.map(w => if w.isFinite && w > 0 then w else 0.0)
+      val sum = clamped.sum
+      if sum <= 0 then Vector.fill(raw.length)(1.0 / raw.length.toDouble)
+      else clamped.map(_ / sum)
+
+  private def buildReplaySlice(
+      currentTrainSize: Int,
+      replayRatio: Double,
+      seed: Int,
+      buffer: Option[ReplayBuffer]
+  ): Vector[Example] =
+    if replayRatio <= 0.0 || currentTrainSize <= 0 then Vector.empty
+    else
+      buffer match
+        case None => Vector.empty
+        case Some(b) if b.examples.isEmpty => Vector.empty
+        case Some(b) =>
+          val replayCount = math.round((currentTrainSize * replayRatio) / (1.0 - replayRatio)).toInt
+          b.sample(replayCount, seed)
 
   def estimateEpochSeconds(
       params: Params,
@@ -346,9 +504,7 @@ object Trainer:
       val n = math.min(sampleSize, trainSet.length)
       val sample = trainSet.take(n)
       val t0 = System.nanoTime()
-      val batchSize =
-        if cfg.batchSize > 0 then cfg.batchSize
-        else if backend.isGpu then 128 else 32
+      val batchSize = if cfg.batchSize > 0 then cfg.batchSize else if backend.isGpu then 128 else 32
       sample.grouped(batchSize).foreach { batch =>
         val contexts = batch.map(_.context).toVector
         val targets = batch.map(_.target).toVector
@@ -356,5 +512,4 @@ object Trainer:
         LanguageModel.backwardBatch(params, cache, targets, cfg.activation, backend)
       }
       val elapsedSec = (System.nanoTime() - t0).toDouble / 1e9
-      if elapsedSec <= 0.0 then 0.0
-      else elapsedSec * trainSet.length.toDouble / n.toDouble
+      if elapsedSec <= 0.0 then 0.0 else elapsedSec * trainSet.length.toDouble / n.toDouble
