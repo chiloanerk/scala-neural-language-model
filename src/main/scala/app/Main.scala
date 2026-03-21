@@ -298,7 +298,7 @@ object Main:
 
     println()
 
-    val tokenizedInputs = inputPaths.map(path => TextPipeline.tokenize(readTextRobust(path)))
+    val tokenizedInputs = inputPaths.map(path => TextPipeline.tokenize(readTextRobust(path, autoConfirm)))
     val vocab = if actuallyFresh || !Files.isRegularFile(VocabPath) then
       TextPipeline.buildVocab(tokenizedInputs.flatten.toVector, maxVocab)
     else
@@ -468,21 +468,63 @@ object Main:
         require(sum > 0, "--inputWeights must include at least one positive value")
         clamped.map(_ / sum)
 
-  private def readTextRobust(path: Path): String =
+  private[app] def utf8CopyPath(path: Path): Path =
+    val fileName = path.getFileName.toString
+    val dot = fileName.lastIndexOf('.')
+    val rewritten =
+      if dot > 0 then
+        val stem = fileName.substring(0, dot)
+        val ext = fileName.substring(dot)
+        s"${stem}.utf8$ext"
+      else s"${fileName}.utf8.txt"
+    val parent = Option(path.getParent).getOrElse(Path.of("."))
+    parent.resolve(rewritten)
+
+  private def readTextWithSystemDefault(path: Path): String =
+    import java.io._
+    val reader = new BufferedReader(new InputStreamReader(Files.newInputStream(path)))
+    try
+      val text = new StringBuilder
+      var line = reader.readLine()
+      while line != null do
+        text.append(line).append("\n")
+        line = reader.readLine()
+      text.toString
+    finally reader.close()
+
+  private def maybeCreateUtf8Copy(path: Path): Option[Path] =
+    println(s"UTF-8 read failed for $path.")
+    val suggested = utf8CopyPath(path)
+    Option(readLineWithPrompt("Create UTF-8 normalized copy and use it for this run? [Y/n]: ")) match
+      case None =>
+        println("No interactive input available; using system default encoding for this run.")
+        None
+      case Some(raw) =>
+        if !CliHelpers.parseYesNo(raw, default = true) then None
+        else
+          val target =
+            if Files.isRegularFile(suggested) then
+              println(s"Using existing UTF-8 copy: $suggested")
+              suggested
+            else
+              println(s"Writing UTF-8 copy: $suggested")
+              val decoded = readTextWithSystemDefault(path)
+              Files.writeString(suggested, decoded, StandardCharsets.UTF_8)
+              suggested
+          Some(target)
+
+  private def readTextRobust(path: Path, autoConfirm: Boolean): String =
     try Files.readString(path, StandardCharsets.UTF_8)
     catch
       case _: Exception =>
-        println(s"UTF-8 read failed for $path, trying with system default encoding...")
-        import java.io._
-        val reader = new BufferedReader(new InputStreamReader(Files.newInputStream(path)))
-        try
-          val text = new StringBuilder
-          var line = reader.readLine()
-          while line != null do
-            text.append(line).append("\n")
-            line = reader.readLine()
-          text.toString
-        finally reader.close()
+        val convertedPath =
+          if autoConfirm then
+            println(s"UTF-8 read failed for $path, trying with system default encoding...")
+            None
+          else maybeCreateUtf8Copy(path)
+        convertedPath match
+          case Some(p) => Files.readString(p, StandardCharsets.UTF_8)
+          case None    => readTextWithSystemDefault(path)
 
   private def runChunker(flags: Map[String, String]): Unit =
     println("\n=== File Chunker ===\n")

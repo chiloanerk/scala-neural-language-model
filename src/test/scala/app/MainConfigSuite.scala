@@ -36,3 +36,13 @@ class MainConfigSuite extends FunSuite:
     val combos = Main.benchmarkMatrix(Some("gpu"), Some("fp32"))
     assertEquals(combos, Vector(("gpu", "fp32")))
   }
+
+  test("utf8CopyPath inserts .utf8 before extension") {
+    val got = Main.utf8CopyPath(java.nio.file.Path.of("data/corpus/bbc-all.txt"))
+    assertEquals(got.toString, "data/corpus/bbc-all.utf8.txt")
+  }
+
+  test("utf8CopyPath appends .utf8.txt when no extension") {
+    val got = Main.utf8CopyPath(java.nio.file.Path.of("data/corpus/bbc-all"))
+    assertEquals(got.toString, "data/corpus/bbc-all.utf8.txt")
+  }
