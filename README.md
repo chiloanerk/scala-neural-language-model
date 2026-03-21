@@ -16,7 +16,7 @@ This project trains a small language model on plain text and predicts likely nex
 
 Observed local performance on M1 (example runs):
 
-- Full training throughput (business corpus): ~`2600-3200 ex/s`
+- Full training throughput (business corpus, GPU fp64): ~`1100 ex/s`
 - Benchmark (`sample=5000`, batch `128`, `fp32`):
   - CPU: `136.0 ex/s`
   - GPU: `1299.6 ex/s`
@@ -39,13 +39,13 @@ sbt "runMain app.Main"
 ### 2) Train (interactive)
 
 ```bash
-sbt "runMain app.Main train"
+sbt "run train"
 ```
 
 ### 3) Train (non-interactive)
 
 ```bash
-sbt "runMain app.Main train --input data/corpus/example-corpus.txt --preset balanced --yes --contextSize 3 --maxVocab 3000"
+sbt "run train --input data/corpus/example-corpus.txt --preset balanced --yes --contextSize 3 --maxVocab 3000"
 ```
 
 ### 4) Predict
@@ -94,7 +94,7 @@ If GPU/JNI is unavailable, GPU selection safely falls back to CPU with diagnosti
 ### `train`
 
 ```bash
-sbt "runMain app.Main train [options]"
+sbt "run train [options]"
 ```
 
 Key options:
@@ -125,6 +125,8 @@ Notes:
 - Model files are persistent: `data/models/latest.ckpt` and `data/models/latest.vocab`
 - `--fresh` is enough to restart from scratch; manual deletion is not required
 - With `--fresh --yes`, include `--contextSize` and `--maxVocab` for fully non-interactive runs
+- Training output uses a live progress display in interactive terminals (static epoch rows + trajectory status)
+- If your terminal does not render live updates, set `TRAIN_PROGRESS_FORCE_TTY=1` (or disable with `TRAIN_PROGRESS_FORCE_TTY=0`)
 
 ### `predict`
 
@@ -190,7 +192,7 @@ cat data/corpus/bbc/business/*.txt > data/corpus/bbc-business.txt
 5. Start fresh training:
 
 ```bash
-sbt "runMain app.Main train --input data/corpus/bbc-business.txt --preset balanced --fresh --yes --contextSize 3 --maxVocab 3000 --precision fp64 --lr 0.02"
+sbt "run train --input data/corpus/bbc-business.txt --preset balanced --fresh --yes --contextSize 3 --maxVocab 3000 --precision fp64 --lr 0.02"
 ```
 
 ## How Checkpoints Work

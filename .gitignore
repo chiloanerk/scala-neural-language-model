@@ -24,3 +24,6 @@ metal-jni/build/
 
 # Logs
 *.log
+
+# Local notes
+QWEN.md

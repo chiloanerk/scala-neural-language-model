@@ -5,7 +5,7 @@ import data.{TextPipeline, VocabIO}
 import eval.Metrics
 import linalg.LinearAlgebra
 import nn.{LanguageModel, ModelConfig}
-import train.{CheckpointIO, TrainConfig, Trainer}
+import train.{CheckpointIO, SaveDecision, TrainConfig, Trainer}
 
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path}
@@ -338,23 +338,38 @@ object Main:
     // Train
     val result = Trainer.train(params0, trainSet, valSet, trainCfg)
 
-    // Save
-    CheckpointIO.save(result.params, cfg, ModelPath)
-    VocabIO.save(vocab, VocabPath)
+    val shouldSave = result.saveDecision != SaveDecision.Discard
+    if shouldSave then
+      CheckpointIO.save(result.params, cfg, ModelPath)
+      VocabIO.save(vocab, VocabPath)
 
     println("\n=== Results ===")
     val bestMetric = result.history.minBy(_.valLoss)
-    val finalMetric = if trainCfg.patience > 0 then bestMetric else result.history.last
-    val restoredNote = if trainCfg.patience > 0 then " (restored best)" else ""
+    val finalMetric =
+      result.saveDecision match
+        case SaveDecision.SaveBest    => bestMetric
+        case SaveDecision.SaveCurrent => result.history.last
+        case SaveDecision.Discard     => result.history.last
+    val restoredNote =
+      result.saveDecision match
+        case SaveDecision.SaveBest if trainCfg.patience > 0 => " (restored best)"
+        case SaveDecision.SaveCurrent if result.interrupted  => " (interrupted: current)"
+        case SaveDecision.Discard if result.interrupted      => " (interrupted: discarded)"
+        case _                                               => ""
     result.history.foreach { m =>
       val indicator = if m.epoch == bestMetric.epoch then " ← best" else ""
-      println(f"  Epoch ${m.epoch}%2d: train=${m.trainLoss}%.4f val=${m.valLoss}%.4f ppl=${m.valPerplexity}%.1f$indicator")
+      println(
+        f"  Epoch ${m.epoch}%2d: train=${m.trainLoss}%.4f val=${m.valLoss}%.4f ppl=${m.valPerplexity}%.1f status=${m.status.toString.toLowerCase}(${m.statusReason}) gap=${m.generalizationGap}%.3f delta=${m.bestDeltaPct}%.2f%%$indicator"
+      )
     }
 
-    println(s"\n✓ Model saved to $ModelPath")
-    println(s"  Vocab saved to $VocabPath")
+    if shouldSave then
+      println(s"\n✓ Model saved to $ModelPath")
+      println(s"  Vocab saved to $VocabPath")
+    else
+      println("\nTraining output discarded; checkpoint and vocab were not saved.")
     println(f"  Final$restoredNote: val_loss=${finalMetric.valLoss}%.4f val_ppl=${finalMetric.valPerplexity}%.1f")
-    if trainCfg.patience > 0 then
+    if trainCfg.patience > 0 && result.history.nonEmpty then
       val last = result.history.last
       println(f"  Last epoch (pre-restore): val_loss=${last.valLoss}%.4f val_ppl=${last.valPerplexity}%.1f")
     println()
