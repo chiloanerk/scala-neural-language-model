@@ -14,6 +14,14 @@ object MetalNativeBridge:
   @native private def deviceNameNative(): String
   @native private def matVecMulNative(matrix: Array[Double], rows: Int, cols: Int, vec: Array[Double]): Array[Double]
   @native private def outerNative(a: Array[Double], b: Array[Double]): Array[Double]
+  @native private def matMulNative(
+      a: Array[Double],
+      aRows: Int,
+      aCols: Int,
+      b: Array[Double],
+      bRows: Int,
+      bCols: Int
+  ): Array[Double]
   @native private def linearActivationNative(
       matrix: Array[Double],
       rows: Int,
@@ -22,6 +30,18 @@ object MetalNativeBridge:
       bias: Array[Double],
       activationCode: Int
   ): Array[Double]
+  @native private def linearActivationBatchNative(
+      x: Array[Double],
+      rows: Int,
+      inCols: Int,
+      wT: Array[Double],
+      wRows: Int,
+      wCols: Int,
+      bias: Array[Double],
+      activationCode: Int
+  ): Array[Double]
+  @native private def softmaxBatchNative(logits: Array[Double], rows: Int, cols: Int): Array[Double]
+  @native private def crossEntropyBatchNative(probs: Array[Double], rows: Int, cols: Int, targets: Array[Int]): Array[Double]
 
   private def failSwitch(name: String): Boolean =
     sys.props.get(s"metal.simulate.fail.$name").exists(_.trim == "1")
@@ -101,6 +121,21 @@ object MetalNativeBridge:
         case p =>
           Left(p.error.getOrElse("Metal unavailable"))
 
+  def tryMatMul(a: Matrix, b: Matrix): Either[String, Matrix] =
+    if failSwitch("matmul") then Left("SIM_FAIL:matmul")
+    else if a.cols != b.rows then Left(s"shape mismatch a.cols=${a.cols} b.rows=${b.rows}")
+    else
+      probe() match
+        case MetalProbe(_, true, _, _) =>
+          try
+            val out = matMulNative(a.data.toArray, a.rows, a.cols, b.data.toArray, b.rows, b.cols)
+            Right(Matrix(out.toVector, a.rows, b.cols))
+          catch
+            case t: Throwable =>
+              Left(s"${t.getClass.getSimpleName}: ${Option(t.getMessage).getOrElse("native matMul failed")}")
+        case p =>
+          Left(p.error.getOrElse("Metal unavailable"))
+
   def tryLinearActivation(m: Matrix, x: Vec, b: Vec, activation: String): Either[String, (Vec, Vec)] =
     if failSwitch("linear") then Left("SIM_FAIL:linearActivation")
     else
@@ -128,5 +163,71 @@ object MetalNativeBridge:
                   Left(s"${t.getClass.getSimpleName}: ${Option(t.getMessage).getOrElse("native linearActivation failed")}")
             case p =>
               Left(p.error.getOrElse("Metal unavailable"))
+
+  def tryLinearActivationBatch(x: Matrix, wT: Matrix, bias: Vec, activation: String): Either[String, (Matrix, Matrix)] =
+    if failSwitch("linear_batch") then Left("SIM_FAIL:linear_batch")
+    else if x.cols != wT.rows then Left(s"shape mismatch x.cols=${x.cols} wT.rows=${wT.rows}")
+    else if wT.cols != bias.length then Left(s"shape mismatch wT.cols=${wT.cols} bias.length=${bias.length}")
+    else
+      val activationCode = activation.toLowerCase match
+        case "relu" => 1
+        case "tanh" => 0
+        case _      => -1
+      if activationCode == -1 then Left(s"unsupported activation: $activation")
+      else
+        probe() match
+          case MetalProbe(_, true, _, _) =>
+            try
+              val packed = linearActivationBatchNative(
+                x.data.toArray,
+                x.rows,
+                x.cols,
+                wT.data.toArray,
+                wT.rows,
+                wT.cols,
+                bias.toArray,
+                activationCode
+              )
+              val expected = x.rows * wT.cols * 2
+              if packed.length != expected then Left(s"native linearActivationBatch returned wrong size=${packed.length} expected=$expected")
+              else
+                val zSize = x.rows * wT.cols
+                val z = Matrix(packed.slice(0, zSize).toVector, x.rows, wT.cols)
+                val a = Matrix(packed.slice(zSize, zSize * 2).toVector, x.rows, wT.cols)
+                Right((z, a))
+            catch
+              case t: Throwable =>
+                Left(s"${t.getClass.getSimpleName}: ${Option(t.getMessage).getOrElse("native linearActivationBatch failed")}")
+          case p =>
+            Left(p.error.getOrElse("Metal unavailable"))
+
+  def trySoftmaxBatch(logits: Matrix): Either[String, Matrix] =
+    if failSwitch("softmax_batch") then Left("SIM_FAIL:softmax_batch")
+    else
+      probe() match
+        case MetalProbe(_, true, _, _) =>
+          try
+            val out = softmaxBatchNative(logits.data.toArray, logits.rows, logits.cols)
+            Right(Matrix(out.toVector, logits.rows, logits.cols))
+          catch
+            case t: Throwable =>
+              Left(s"${t.getClass.getSimpleName}: ${Option(t.getMessage).getOrElse("native softmaxBatch failed")}")
+        case p =>
+          Left(p.error.getOrElse("Metal unavailable"))
+
+  def tryCrossEntropyBatch(probs: Matrix, targets: Vector[Int]): Either[String, Vec] =
+    if failSwitch("ce_batch") then Left("SIM_FAIL:ce_batch")
+    else if probs.rows != targets.length then Left(s"shape mismatch probs.rows=${probs.rows} targets=${targets.length}")
+    else
+      probe() match
+        case MetalProbe(_, true, _, _) =>
+          try
+            val out = crossEntropyBatchNative(probs.data.toArray, probs.rows, probs.cols, targets.toArray)
+            Right(out.toVector)
+          catch
+            case t: Throwable =>
+              Left(s"${t.getClass.getSimpleName}: ${Option(t.getMessage).getOrElse("native crossEntropyBatch failed")}")
+        case p =>
+          Left(p.error.getOrElse("Metal unavailable"))
 
 final case class MetalProbe(loaded: Boolean, available: Boolean, deviceName: String, error: Option[String])
