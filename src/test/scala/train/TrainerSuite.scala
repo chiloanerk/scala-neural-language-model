@@ -92,6 +92,15 @@ class TrainerSuite extends FunSuite:
     assertEquals(t.status, TrainingStatus.Regressing)
   }
 
+  test("trajectory classifier treats tiny delta as plateau instead of regression noise") {
+    val history = Vector(
+      EpochMetrics(epoch = 1, trainLoss = 4.1, valLoss = 4.20, valPerplexity = 66.7, learningRate = 0.01, generalizationGap = 0.02),
+      EpochMetrics(epoch = 2, trainLoss = 4.0, valLoss = 4.19, valPerplexity = 66.0, learningRate = 0.01, generalizationGap = 0.03)
+    )
+    val t = Trainer.classifyTrajectory(history, trainLoss = 3.99, valLoss = 4.194)
+    assertEquals(t.status, TrainingStatus.Stalled)
+  }
+
   test("interrupt decision defaults to save best in non-interactive mode") {
     val got = Trainer.resolveInterruptDecision(interactive = false, _ => "d")
     assertEquals(got, SaveDecision.SaveBest)

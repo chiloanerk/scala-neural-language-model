@@ -89,11 +89,19 @@ object Trainer:
     val gapWidening = prevGap.exists(g => gap > g + 0.01)
     val improvingTrend = valTrend3 < -1e-4
     val worseningTrend = valTrend3 > 1e-4
+    val deltaDeadbandPct = 0.1
+    val nearFlatDelta = math.abs(bestDeltaPct) < deltaDeadbandPct
 
     if history.isEmpty then
       Trajectory(TrainingStatus.Improving, "baseline", bestDeltaPct, gap, valTrend3)
     else if bestDeltaPct >= 0.5 then
       Trajectory(TrainingStatus.Improving, "better val", bestDeltaPct, gap, valTrend3)
+    else if nearFlatDelta && improvingTrend && !gapWidening then
+      Trajectory(TrainingStatus.Improving, "slow improvement", bestDeltaPct, gap, valTrend3)
+    else if nearFlatDelta && (worseningTrend || gapWidening) then
+      Trajectory(TrainingStatus.Stalled, "minor drift", bestDeltaPct, gap, valTrend3)
+    else if nearFlatDelta then
+      Trajectory(TrainingStatus.Stalled, "near plateau", bestDeltaPct, gap, valTrend3)
     else if improvingTrend && !gapWidening then
       Trajectory(TrainingStatus.Improving, "improving trend", bestDeltaPct, gap, valTrend3)
     else if bestDeltaPct < -0.5 then

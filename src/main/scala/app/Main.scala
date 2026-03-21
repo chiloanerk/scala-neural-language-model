@@ -494,7 +494,7 @@ object Main:
     // Check model exists
     if !Files.isRegularFile(ModelPath) then
       println("No model found. Train first:")
-      println("  sbt \"runMain app.Main train --input data/corpus/text.txt\"")
+      println("  sbt \"run train --input data/corpus/text.txt\"")
       sys.exit(1)
 
     val (params, cfg) = CheckpointIO.load(ModelPath)
@@ -508,29 +508,41 @@ object Main:
     println(s"Model: ${vocab.size} words, context=${cfg.contextSize}")
     println()
 
-    // Get context
-    val contextText = flags.get("context") match
-      case Some(text) => text
+    val topK = CliHelpers.boundedTopK(flags.get("topK").flatMap(_.toIntOption).getOrElse(5))
+    def predictOnce(contextText: String): Unit =
+      val tokens = TextPipeline.tokenize(contextText)
+      val contextIds = adaptContext(tokens.map(vocab.toId), cfg.contextSize, vocab.unkId)
+      val cache = LanguageModel.forward(params, contextIds, cfg.activation, backend)
+      val top = LinearAlgebra.argTopK(cache.probs, topK)
+
+      println("\nTop predictions:")
+      top.zipWithIndex.foreach { case ((id, prob), idx) =>
+        val word = vocab.toToken(id)
+        val bar = "█" * ((prob * 20).toInt max 1)
+        println(f"  ${idx + 1}. $word%-12s $bar%-20s ${prob * 100}%.1f%%")
+      }
+
+      top.headOption.foreach { case (id, prob) =>
+        if id == vocab.unkId && prob >= 0.2 then
+          println("  Tip: high <UNK> confidence. Try longer context, in-domain words, or retrain with larger --maxVocab.")
+      }
+
+    flags.get("context") match
+      case Some(text) =>
+        predictOnce(text)
       case None =>
         println("Enter text to predict next word (or 'quit'):")
-        val raw = StdIn.readLine("> ")
-        if raw == null || raw.trim.toLowerCase == "quit" then sys.exit(0)
-        raw.trim
-
-    val topK = CliHelpers.boundedTopK(flags.get("topK").flatMap(_.toIntOption).getOrElse(5))
-
-    val tokens = TextPipeline.tokenize(contextText)
-    val contextIds = adaptContext(tokens.map(vocab.toId), cfg.contextSize, vocab.unkId)
-
-    val cache = LanguageModel.forward(params, contextIds, cfg.activation, backend)
-    val top = LinearAlgebra.argTopK(cache.probs, topK)
-
-    println("\nTop predictions:")
-    top.zipWithIndex.foreach { case ((id, prob), idx) =>
-      val word = vocab.toToken(id)
-      val bar = "█" * ((prob * 20).toInt max 1)
-      println(f"  ${idx + 1}. $word%-12s $bar%-20s ${prob * 100}%.1f%%")
-    }
+        var keepRunning = true
+        while keepRunning do
+          val raw = StdIn.readLine("> ")
+          if raw == null then
+            keepRunning = false
+          else
+            val normalized = raw.trim
+            if normalized.equalsIgnoreCase("quit") || normalized.equalsIgnoreCase("exit") then
+              keepRunning = false
+            else if normalized.nonEmpty then
+              predictOnce(normalized)
 
   private def runGpuInfo(flags: Map[String, String]): Unit =
     val backendName = BackendSelector.normalizeBackend(flags.getOrElse("backend", "gpu"))
