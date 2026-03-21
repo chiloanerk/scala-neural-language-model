@@ -159,7 +159,7 @@ object Main:
     val presetName = flags.getOrElse("preset", {
       println("\nChoose training quality:")
       presets.zipWithIndex.foreach { case (p, idx) =>
-        println(s"  ${idx + 1}. ${p.name.capitalize} - ${p.description}")
+        println(s"  ${idx + 1}. ${p.name.capitalize} - ${p.description} (${p.epochs} epochs, patience=${p.patience})")
       }
       val raw = readTrimmedRequired("\nSelect preset [2]: ", "select preset")
       val idx = CliHelpers.parseMenuChoice(raw, optionCount = presets.length, defaultIndex = 1).getOrElse(1)
@@ -177,13 +177,57 @@ object Main:
     val batchSize = flags.get("batchSize").flatMap(_.toIntOption).getOrElse(0)
     val prefetch = flags.get("prefetch").flatMap(_.toIntOption).getOrElse(1)
     val profileGpu = flags.get("profileGpu").exists(CliHelpers.isTruthy)
-    val replayRatio = flags.get("replayRatio").flatMap(_.toDoubleOption).getOrElse(0.3)
-    val replayBufferSize = flags.get("replayBufferSize").flatMap(_.toIntOption).getOrElse(0)
-    val replayBufferPath = flags.get("replayBufferPath").map(Path.of(_))
+    val autoConfirm = flags.get("yes").exists(CliHelpers.isTruthy)
+    val replayFlagsProvided = flags.contains("replayRatio") || flags.contains("replayBufferSize") || flags.contains("replayBufferPath")
+    val replayFileDefault = ReplayPath
+    val replayFileExists = Files.isRegularFile(replayFileDefault)
+    var replayRatio = flags.get("replayRatio").flatMap(_.toDoubleOption).getOrElse(0.3)
+    var replayBufferSize = flags.get("replayBufferSize").flatMap(_.toIntOption).getOrElse(0)
+    var replayBufferPath = flags.get("replayBufferPath").map(Path.of(_))
     val ewcLambda = flags.get("ewcLambda").flatMap(_.toDoubleOption).getOrElse(0.0)
     val ewcSamples = flags.get("ewcSamples").flatMap(_.toIntOption).getOrElse(0)
     if flags.get("gpuInfo").exists(CliHelpers.isTruthy) then
       println(s"GPU info: ${BackendSelector.gpuInfo(precision)}")
+
+    if !replayFlagsProvided then
+      if hasExistingModel && !actuallyFresh then
+        replayRatio = 0.3
+        if replayFileExists then replayBufferPath = Some(replayFileDefault)
+        if replayBufferSize <= 0 then replayBufferSize = 10000
+
+        if !autoConfirm then
+          println("\nReplay options:")
+          if replayFileExists then println(s"  Found replay memory: $replayFileDefault")
+          else println("  No replay memory file found yet; one can be created after this run.")
+          println("  What replay does: mixes old-domain examples into new training to reduce forgetting.")
+          println("  Replay ratio guide:")
+          println("    - lower (0.1-0.2): faster training, weaker retention")
+          println("    - medium (0.3): balanced speed vs retention (recommended)")
+          println("    - higher (0.4-0.6): stronger retention, slower adaptation/training")
+          println("  1. Use replay defaults (recommended)")
+          println("  2. Disable replay for this run (fastest, but higher forgetting risk)")
+          println("  3. Customize replay settings")
+          val choiceRaw = readTrimmedRequired("Select [1]: ", "select replay option")
+          CliHelpers.parseMenuChoice(choiceRaw, optionCount = 3, defaultIndex = 0).getOrElse(0) match
+            case 1 =>
+              replayRatio = 0.0
+              replayBufferSize = 0
+              replayBufferPath = None
+            case 2 =>
+              val ratioRaw = readTrimmedRequired(f"Replay ratio [${replayRatio}%.2f]: ", "replay ratio")
+              replayRatio = if ratioRaw.isEmpty then replayRatio else ratioRaw.toDoubleOption.getOrElse(replayRatio)
+              val sizeRaw = readTrimmedRequired(s"Replay buffer size [$replayBufferSize]: ", "replay buffer size")
+              replayBufferSize = if sizeRaw.isEmpty then replayBufferSize else sizeRaw.toIntOption.getOrElse(replayBufferSize)
+              if replayFileExists then
+                val useExisting = promptYesNo(s"Use existing replay file ($replayFileDefault)?", true)
+                replayBufferPath = if useExisting then Some(replayFileDefault) else None
+            case _ => ()
+      else if actuallyFresh && !autoConfirm then
+        val enableReplay = promptYesNo("Enable replay memory for this fresh run and future continual training?", true)
+        if enableReplay then
+          replayRatio = 0.3
+          replayBufferSize = 10000
+          replayBufferPath = Some(replayFileDefault)
 
     require(replayRatio >= 0.0 && replayRatio < 1.0, s"--replayRatio must be in [0,1), got $replayRatio")
     require(replayBufferSize >= 0, s"--replayBufferSize must be >=0, got $replayBufferSize")
@@ -243,7 +287,6 @@ object Main:
     else println(s"  🆕 Starting fresh model")
     println()
 
-    val autoConfirm = flags.get("yes").exists(CliHelpers.isTruthy)
     val confirm = if autoConfirm then
       println("Auto-confirming (--yes flag)")
       true
@@ -709,10 +752,29 @@ object Main:
       lines.size()
     catch
       case _: Exception =>
-        // Try with default charset, or return 0 if that fails too
         try
-          val lines = Files.readAllLines(path)
-          lines.size()
+          // Fallback to a byte-level newline count so we still produce a useful
+          // estimate even when charset decoding fails.
+          val in = Files.newInputStream(path)
+          try
+            val buffer = new Array[Byte](8192)
+            var lineCount = 0
+            var sawAnyByte = false
+            var lastByte: Int = -1
+            var read = in.read(buffer)
+            while read != -1 do
+              var i = 0
+              while i < read do
+                val b = buffer(i) & 0xff
+                if b == '\n' then lineCount += 1
+                sawAnyByte = true
+                lastByte = b
+                i += 1
+              read = in.read(buffer)
+            if !sawAnyByte then 0
+            else if lastByte == '\n' then lineCount
+            else lineCount + 1
+          finally in.close()
         catch
           case _: Exception => 0
 
