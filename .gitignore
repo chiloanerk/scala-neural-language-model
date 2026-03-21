@@ -15,11 +15,9 @@ project/project/
 data/models/*.ckpt
 data/models/*.vocab
 
-# Chunked files (can be regenerated)
-data/corpus/chunks/
-data/corpus/*/chunks/
-data/corpus/bbc/
-data/corpus/bbc-entertainment.txt
+# Corpus policy: only keep the small example corpus tracked
+data/corpus/*
+!data/corpus/example-corpus.txt
 
 # Local native build artifacts
 metal-jni/build/
