@@ -1,5 +1,6 @@
 package train
 
+import compute.{BackendSelector, ComputeBackend}
 import data.Example
 import eval.Metrics
 import nn.{LanguageModel, Params}
@@ -14,7 +15,9 @@ final case class TrainConfig(
     shuffleEachEpoch: Boolean = true,
     seed: Int = 42,
     patience: Int = 0,  // 0 = disabled, >0 = early stopping enabled
-    activation: String = "tanh"
+    activation: String = "tanh",
+    backend: String = "gpu",
+    precision: String = "fp64"
 )
 
 final case class EpochMetrics(epoch: Int, trainLoss: Double, valLoss: Double, valPerplexity: Double, learningRate: Double)
@@ -35,6 +38,12 @@ object Trainer:
     require(cfg.lrDecay > 0.0, s"lrDecay must be > 0, got ${cfg.lrDecay}")
     require(cfg.patience >= 0, s"patience must be >= 0, got ${cfg.patience}")
 
+    val backend = BackendSelector.fromConfig(cfg.backend, cfg.precision, warn = msg => println(s"  [backend] $msg"))
+    println(s"Using backend: ${backend.diagnostics}")
+    if backend.isGpu then
+      val ops = if backend.gpuOpsEnabled.nonEmpty then backend.gpuOpsEnabled.toVector.sorted.mkString(", ") else "none"
+      println(s"GPU ops enabled: $ops")
+
     var params = initial
     var lr = cfg.learningRate
     var history = Vector.empty[EpochMetrics]
@@ -48,6 +57,11 @@ object Trainer:
     val totalExamples = trainSet.length
     // Show progress every 10% or every 100 examples, whichever is smaller
     val progressInterval = math.max(100, totalExamples / 10)
+    val estimateSec = estimateEpochSeconds(params, trainSet, cfg, backend)
+    if estimateSec > 0 then
+      println(f"Estimated epoch time: ${estimateSec / 60.0}%.1f min (${estimateSec}%.0f sec)")
+      if estimateSec > 120 then
+        println("  Tip: long epoch detected. Consider chunking input, contextSize<=3, and lower maxVocab for faster iteration.")
 
     var epoch = 1
     while epoch <= cfg.epochs do
@@ -60,7 +74,15 @@ object Trainer:
       var lossSum = 0.0
       var seen = 0
       epochData.foreach { ex =>
-        val (updated, loss) = LanguageModel.trainStep(params, ex, lr, l2 = cfg.l2, clipNorm = cfg.clipNorm, activation = cfg.activation)
+        val (updated, loss) = LanguageModel.trainStep(
+          params,
+          ex,
+          lr,
+          l2 = cfg.l2,
+          clipNorm = cfg.clipNorm,
+          activation = cfg.activation,
+          backend = backend
+        )
         params = updated
         lossSum += loss
         seen += 1
@@ -82,7 +104,7 @@ object Trainer:
       println(f"  Epoch $epoch complete in ${epochTime}%.1fs - train_loss=$trainLoss%.6f")
       println(f"  Computing validation metrics...")
 
-      val valLoss = Metrics.meanLoss(params, valSet, cfg.activation)
+      val valLoss = Metrics.meanLoss(params, valSet, cfg.activation, backend)
       val ppl = Metrics.perplexity(valLoss)
       println(f"  val_loss=$valLoss%.6f val_ppl=$ppl%.4f")
 
@@ -113,3 +135,23 @@ object Trainer:
 
     println("Training complete!")
     TrainResult(params = bestParams, history = history)
+
+  def estimateEpochSeconds(
+      params: Params,
+      trainSet: Vector[Example],
+      cfg: TrainConfig,
+      backend: ComputeBackend,
+      sampleSize: Int = 200
+  ): Double =
+    if trainSet.isEmpty then 0.0
+    else
+      val n = math.min(sampleSize, trainSet.length)
+      val sample = trainSet.take(n)
+      val t0 = System.nanoTime()
+      sample.foreach { ex =>
+        val cache = LanguageModel.forward(params, ex.context, cfg.activation, backend)
+        LanguageModel.backward(params, cache, ex.target, cfg.activation, backend)
+      }
+      val elapsedSec = (System.nanoTime() - t0).toDouble / 1e9
+      if elapsedSec <= 0.0 then 0.0
+      else elapsedSec * trainSet.length.toDouble / n.toDouble

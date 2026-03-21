@@ -1,5 +1,6 @@
 package app
 
+import compute.BackendSelector
 import data.{TextPipeline, VocabIO}
 import eval.Metrics
 import linalg.LinearAlgebra
@@ -7,7 +8,7 @@ import nn.{LanguageModel, ModelConfig}
 import train.{CheckpointIO, TrainConfig, Trainer}
 
 import java.nio.charset.StandardCharsets
-import java.nio.file.{Files, Path, StandardOpenOption}
+import java.nio.file.{Files, Path}
 import scala.io.StdIn
 import scala.jdk.CollectionConverters._
 import scala.util.Using
@@ -27,15 +28,32 @@ object Main:
     Preset("thorough", 50, 10, 128, 48, "Best quality (~10 min)")
   )
 
+  private def readLineWithPrompt(prompt: String): String | Null =
+    // sbt forked runs can buffer non-newline output; print prompt as its own line.
+    println(prompt)
+    Console.out.flush()
+    StdIn.readLine()
+
+  private def readTrimmedRequired(prompt: String, field: String): String =
+    Option(readLineWithPrompt(prompt)) match
+      case Some(v) => v.trim
+      case None =>
+        println(s"\nNo interactive input available for '$field'.")
+        println("Run with explicit flags for non-interactive mode (and add --yes to auto-confirm).")
+        sys.exit(1)
+        ""
+
   def main(args: Array[String]): Unit =
     if args.isEmpty then
       showMainMenu()
       sys.exit(0)
 
     args(0) match
-      case "train"   => runTrain(parseArgs(args.drop(1)))
-      case "predict" => runPredict(parseArgs(args.drop(1)))
-      case "chunk"   => runChunker(parseArgs(args.drop(1)))
+      case "train"   => runTrain(CliHelpers.parseArgs(args.drop(1)))
+      case "predict" => runPredict(CliHelpers.parseArgs(args.drop(1)))
+      case "chunk"   => runChunker(CliHelpers.parseArgs(args.drop(1)))
+      case "gpu-info" => runGpuInfo(CliHelpers.parseArgs(args.drop(1)))
+      case "benchmark" => runBenchmark(CliHelpers.parseArgs(args.drop(1)))
       case "test"    => TestRunner.main(Array.empty)
       case _ =>
         printUsage()
@@ -57,12 +75,15 @@ object Main:
       |  train   - Train or continue training your model
       |  predict - Predict next words
       |  chunk   - Split large files into training chunks
+      |  gpu-info - Check Metal/JNI status
+      |  benchmark - Compare CPU/GPU throughput estimate
       |  test    - Run built-in tests
       |
       |Quick start:
       |  sbt "runMain app.Main train --input data/corpus/text.txt"
       |  sbt "runMain app.Main predict --context 'the cat'"
       |  sbt "runMain app.Main chunk --input large-file.txt --lines 1000"
+      |  sbt "runMain app.Main gpu-info --precision fp32"
       |""".stripMargin)
 
   private def runTrain(flags: Map[String, String]): Unit =
@@ -80,7 +101,7 @@ object Main:
       println("  1. Continue training (default)")
       println("  2. Start fresh (new model, ignores existing)")
       println()
-      val raw = StdIn.readLine("Select [1]: ").trim
+      val raw = readTrimmedRequired("Select [1]: ", "select action")
       CliHelpers.parseMenuChoice(raw, optionCount = 2, defaultIndex = 0).contains(1)
     else if freshTraining then
       println("Starting fresh training (ignoring any existing model).\n")
@@ -134,7 +155,7 @@ object Main:
         
         var selected: Option[Path] = None
         while selected.isEmpty do
-          val raw = StdIn.readLine(s"Choose file number [1]: ").trim
+          val raw = readTrimmedRequired(s"Choose file number [1]: ", "choose training file")
           CliHelpers.parseMenuChoice(raw, optionCount = orderedPaths.length, defaultIndex = 0) match
             case Some(idx) => selected = Some(orderedPaths(idx))
             case None      => println(s"Please choose 1-${orderedPaths.length}.")
@@ -154,7 +175,7 @@ object Main:
       presets.zipWithIndex.foreach { case (p, idx) =>
         println(s"  ${idx + 1}. ${p.name.capitalize} - ${p.description}")
       }
-      val raw = StdIn.readLine("\nSelect preset [2]: ").trim
+      val raw = readTrimmedRequired("\nSelect preset [2]: ", "select preset")
       val idx = CliHelpers.parseMenuChoice(raw, optionCount = presets.length, defaultIndex = 1).getOrElse(1)
       presets(idx).name
     }
@@ -162,6 +183,10 @@ object Main:
       println(s"Unknown preset '$presetName'. Using 'balanced'.")
       presets(1)
     }
+    val backend = BackendSelector.normalizeBackend(flags.getOrElse("backend", "gpu"))
+    val precision = BackendSelector.normalizePrecision(flags.getOrElse("precision", "fp64"))
+    if flags.get("gpuInfo").exists(CliHelpers.isTruthy) then
+      println(s"GPU info: ${BackendSelector.gpuInfo(precision)}")
 
     // Get advanced options - use existing model's architecture if available
     val contextSize = flags.get("contextSize").map(_.toInt).getOrElse {
@@ -170,7 +195,7 @@ object Main:
           println(s"\nUsing existing model architecture: context=${cfg.contextSize}")
           cfg.contextSize
         case None =>
-          val raw = StdIn.readLine("\nContext size (words to look back) [3]: ").trim
+          val raw = readTrimmedRequired("\nContext size (words to look back) [3]: ", "context size")
           raw.toIntOption.getOrElse(3)
     }
     val maxVocab = flags.get("maxVocab").map(_.toInt).getOrElse {
@@ -179,7 +204,7 @@ object Main:
           println(s"Using existing model vocabulary size: ${cfg.vocabSize}")
           cfg.vocabSize
         case None =>
-          val raw = StdIn.readLine("Max vocabulary (unique words) [3000]: ").trim
+          val raw = readTrimmedRequired("Max vocabulary (unique words) [3000]: ", "max vocabulary")
           raw.toIntOption.getOrElse(3000)
     }
 
@@ -192,6 +217,7 @@ object Main:
     println(s"  Preset: ${preset.name.capitalize} (${preset.epochs} epochs, patience=${preset.patience})")
     println(s"  Context size: $contextSize")
     println(s"  Max vocab: $maxVocab")
+    println(s"  Backend: $backend ($precision)")
     if actuallyFresh then
       println(s"  🆕 Starting fresh model (new architecture)")
     else if existingCfg.isDefined then
@@ -270,7 +296,9 @@ object Main:
       shuffleEachEpoch = true,
       seed = 42,
       patience = preset.patience,
-      activation = "tanh"
+      activation = "tanh",
+      backend = backend,
+      precision = precision
     )
 
     // Train
@@ -288,7 +316,7 @@ object Main:
 
     println(s"\n✓ Model saved to $ModelPath")
     println(s"  Vocab saved to $VocabPath")
-    println(s"  Final: val_loss=${result.history.last.valLoss}%.4f val_ppl=${result.history.last.valPerplexity}%.1f")
+    println(f"  Final: val_loss=${result.history.last.valLoss}%.4f val_ppl=${result.history.last.valPerplexity}%.1f")
     println()
     println("Continue with: sbt \"runMain app.Main train --input <more-data.txt>\"")
     println("Or predict:    sbt \"runMain app.Main predict --context 'your text'\"")
@@ -316,7 +344,7 @@ object Main:
         
         var selected: Option[Path] = None
         while selected.isEmpty do
-          val raw = StdIn.readLine("Choose file number: ").trim
+          val raw = readTrimmedRequired("Choose file number: ", "choose file number")
           CliHelpers.parseMenuChoice(raw, optionCount = candidates.length, defaultIndex = 0) match
             case Some(idx) => selected = Some(candidates(idx))
             case None      => println(s"Please choose 1-${candidates.length}.")
@@ -338,7 +366,7 @@ object Main:
       
       var size: Option[Int] = None
       while size.isEmpty do
-        val raw = StdIn.readLine(s"Lines per chunk [$recommended]: ").trim
+        val raw = readTrimmedRequired(s"Lines per chunk [$recommended]: ", "lines per chunk")
         size = if raw.isEmpty then Some(recommended) else raw.toIntOption
         if size.isEmpty then println("Please enter a number.")
       size.get
@@ -416,6 +444,11 @@ object Main:
 
     val (params, cfg) = CheckpointIO.load(ModelPath)
     val vocab = VocabIO.load(VocabPath)
+    val backend = BackendSelector.fromConfig(
+      flags.getOrElse("backend", "gpu"),
+      flags.getOrElse("precision", "fp64"),
+      warn = msg => println(s"[backend] $msg")
+    )
 
     println(s"Model: ${vocab.size} words, context=${cfg.contextSize}")
     println()
@@ -434,7 +467,7 @@ object Main:
     val tokens = TextPipeline.tokenize(contextText)
     val contextIds = adaptContext(tokens.map(vocab.toId), cfg.contextSize, vocab.unkId)
 
-    val cache = LanguageModel.forward(params, contextIds)
+    val cache = LanguageModel.forward(params, contextIds, cfg.activation, backend)
     val top = LinearAlgebra.argTopK(cache.probs, topK)
 
     println("\nTop predictions:")
@@ -443,6 +476,75 @@ object Main:
       val bar = "█" * ((prob * 20).toInt max 1)
       println(f"  ${idx + 1}. $word%-12s $bar%-20s ${prob * 100}%.1f%%")
     }
+
+  private def runGpuInfo(flags: Map[String, String]): Unit =
+    val precision = BackendSelector.normalizePrecision(flags.getOrElse("precision", "fp64"))
+    println(s"\nGPU probe ($precision): ${BackendSelector.gpuInfo(precision)}")
+
+  private def runBenchmark(flags: Map[String, String]): Unit =
+    println("\n=== Benchmark ===")
+    val inputPath = Path.of(flags.getOrElse("input", "data/corpus/example-corpus.txt"))
+    if !Files.isRegularFile(inputPath) then
+      println(s"Input file not found: $inputPath")
+      sys.exit(1)
+
+    val contextSize = flags.get("contextSize").flatMap(_.toIntOption).getOrElse(3)
+    val maxVocab = flags.get("maxVocab").flatMap(_.toIntOption).getOrElse(3000)
+    val sample = flags.get("sample").flatMap(_.toIntOption).getOrElse(2000)
+    val precision = BackendSelector.normalizePrecision(flags.getOrElse("precision", "fp64"))
+    val activation = flags.getOrElse("activation", "tanh")
+
+    val raw = Files.readString(inputPath, StandardCharsets.UTF_8)
+    val tokens = TextPipeline.tokenize(raw)
+    val vocab = TextPipeline.buildVocab(tokens, maxVocab)
+    val ids = TextPipeline.tokensToIds(tokens, vocab)
+    val examples = TextPipeline.buildExamples(ids, contextSize).take(sample)
+    if examples.isEmpty then
+      println("No examples to benchmark. Adjust context/sample.")
+      return
+
+    val cfg = ModelConfig(contextSize = contextSize, embedDim = 24, hiddenDim = 64, vocabSize = vocab.size, activation = activation)
+    val params = LanguageModel.initParams(cfg, seed = 42)
+
+    def bench(label: String, backendName: String): Double =
+      val backend = BackendSelector.fromConfig(backendName, precision, warn = _ => ())
+      val trainCfg = TrainConfig(epochs = 1, activation = activation, backend = backendName, precision = precision)
+      val sec = Trainer.estimateEpochSeconds(params, examples, trainCfg, backend, sampleSize = math.min(500, examples.length))
+      val exPerSec = if sec <= 0 then 0.0 else examples.length / sec
+      println(f"$label%-4s backend=${backend.diagnostics} | est=${sec}%.2fs for ${examples.length} ex | ${exPerSec}%.1f ex/s")
+      exPerSec
+
+    val cpu = bench("CPU", "cpu")
+    val gpu = bench("GPU", "gpu")
+    if cpu > 0 && gpu > 0 then println(f"Speedup (GPU/CPU): ${gpu / cpu}%.2fx")
+
+    println("\nPer-op timing (synthetic)")
+    def benchOps(label: String, backendName: String): Unit =
+      val backend = BackendSelector.fromConfig(backendName, precision, warn = _ => ())
+      val rows = 256
+      val cols = 256
+      val m = linalg.Matrix.fromFunction(rows, cols)((r, c) => ((r + c) % 17) * 0.01)
+      val x = Vector.tabulate(cols)(i => (i % 13) * 0.01)
+      val b = Vector.tabulate(rows)(i => (i % 7) * 0.01)
+      val a = Vector.tabulate(rows)(i => (i % 11) * 0.01)
+      val o = Vector.tabulate(cols)(i => (i % 5) * 0.01)
+      val iters = 100
+
+      def timeMs(fn: => Unit): Double =
+        val t0 = System.nanoTime()
+        var i = 0
+        while i < iters do
+          fn
+          i += 1
+        (System.nanoTime() - t0).toDouble / 1e6
+
+      val matVecMs = timeMs { backend.matVecMul(m, x); () }
+      val outerMs = timeMs { backend.outer(a, o); () }
+      val fusedMs = timeMs { backend.linearActivation(m, x, b, activation); () }
+      println(f"$label%-4s matVec=${matVecMs / iters}%.3fms outer=${outerMs / iters}%.3fms fused=${fusedMs / iters}%.3fms")
+
+    benchOps("CPU", "cpu")
+    benchOps("GPU", "gpu")
 
   private def adaptContext(ids: Vector[Int], contextSize: Int, padId: Int): Vector[Int] =
     if ids.length >= contextSize then ids.takeRight(contextSize)
@@ -473,18 +575,13 @@ object Main:
           .take(maxResults)
       }
 
-  private def parseArgs(args: Array[String]): Map[String, String] =
-    args.toVector
-      .sliding(2, 2)
-      .collect {
-        case Vector(k, v) if k.startsWith("--") => k.stripPrefix("--") -> v
-      }
-      .toMap
-
   private def promptYesNo(label: String, default: Boolean): Boolean =
     val defaultStr = if default then "Y/n" else "y/N"
-    val raw = StdIn.readLine(s"$label [$defaultStr]: ")
-    if raw == null then default else CliHelpers.parseYesNo(raw, default)
+    val raw = readLineWithPrompt(s"$label [$defaultStr]: ")
+    val resolved = CliHelpers.resolveConfirmation(raw, default, autoConfirm = false)
+    if raw == null then
+      println("\nNo interactive input available for confirmation; canceling for safety.")
+    resolved
 
   private def printUsage(): Unit =
     println(
@@ -494,6 +591,8 @@ object Main:
         |  sbt "runMain app.Main train"        Train/continue training
         |  sbt "runMain app.Main predict"      Predict next words
         |  sbt "runMain app.Main chunk"        Split large files into chunks
+        |  sbt "runMain app.Main gpu-info"     Show Metal/JNI status
+        |  sbt "runMain app.Main benchmark"    Compare CPU/GPU throughput estimate
         |
         |Training:
         |  --input FILE      Training text file (required)
@@ -501,6 +600,9 @@ object Main:
         |  --fresh           Start fresh (ignore existing model)
         |  --contextSize N   Words to look back (default: 3)
         |  --maxVocab N      Max unique words (default: 3000)
+        |  --backend NAME    cpu|gpu (default: gpu)
+        |  --precision MODE  fp64|fp32 (default: fp64)
+        |  --gpuInfo         Print GPU probe details before training
         |
         |Chunking:
         |  --input FILE      File to split (required, or select interactively)
@@ -511,6 +613,18 @@ object Main:
         |Prediction:
         |  --context TEXT    Words to continue from
         |  --topK N          Predictions to show (default: 5)
+        |  --backend NAME    cpu|gpu (default: gpu)
+        |  --precision MODE  fp64|fp32 (default: fp64)
+
+        |GPU:
+        |  sbt "runMain app.Main gpu-info --precision fp64"
+        |
+        |Benchmark:
+        |  --input FILE      Corpus text path
+        |  --contextSize N   Context size (default: 3)
+        |  --maxVocab N      Max vocab (default: 3000)
+        |  --sample N        Number of examples (default: 2000)
+        |  --precision MODE  fp64|fp32 (default: fp64)
         |
         |Examples:
         |  sbt "runMain app.Main train --input data/corpus/text.txt"

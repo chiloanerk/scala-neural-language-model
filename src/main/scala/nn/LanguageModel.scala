@@ -1,5 +1,6 @@
 package nn
 
+import compute.{ComputeBackend, CpuBackend}
 import data.Example
 import linalg.{LinearAlgebra, Matrix, Vec}
 import scala.util.Random
@@ -28,27 +29,31 @@ object LanguageModel:
     val bound = math.sqrt(6.0) / math.sqrt(fanIn.toDouble + fanOut.toDouble)
     Matrix.fromFunction(fanOut, fanIn)((_, _) => rnd.between(-bound, bound))
 
-  def forward(p: Params, context: Vector[Int], activation: String = "tanh"): ForwardCache =
+  def forward(
+      p: Params,
+      context: Vector[Int],
+      activation: String = "tanh",
+      backend: ComputeBackend = CpuBackend.Default
+  ): ForwardCache =
     require(context.nonEmpty, "context cannot be empty")
 
     val x = context.flatMap(id => p.E.rowSlice(id))
-    val z1 = LinearAlgebra.vecAdd(LinearAlgebra.matVecMul(p.W1, x), p.b1)
-    val a1 = applyActivation(z1, activation)
-    val logits = LinearAlgebra.vecAdd(LinearAlgebra.matVecMul(p.W2, a1), p.b2)
-    val probs = LinearAlgebra.softmaxStable(logits)
+    val (z1, a1) = backend.linearActivation(p.W1, x, p.b1, activation)
+    val logits = backend.vecAdd(backend.matVecMul(p.W2, a1), p.b2)
+    val probs = backend.softmaxStable(logits)
 
     ForwardCache(x = x, z1 = z1, a1 = a1, logits = logits, probs = probs, context = context)
 
-  private def applyActivation(v: Vec, activation: String): Vec =
-    activation.toLowerCase match
-      case "relu" => LinearAlgebra.relu(v)
-      case "tanh" => LinearAlgebra.tanhVec(v)
-      case _      => throw new IllegalArgumentException(s"Unknown activation: $activation. Use 'relu' or 'tanh'.")
+  def lossFromCache(cache: ForwardCache, target: Int, backend: ComputeBackend = CpuBackend.Default): Double =
+    backend.crossEntropy(cache.probs, target)
 
-  def lossFromCache(cache: ForwardCache, target: Int): Double =
-    LinearAlgebra.crossEntropy(cache.probs, target)
-
-  def backward(p: Params, cache: ForwardCache, target: Int, activation: String = "tanh"): Grads =
+  def backward(
+      p: Params,
+      cache: ForwardCache,
+      target: Int,
+      activation: String = "tanh",
+      backend: ComputeBackend = CpuBackend.Default
+  ): Grads =
     val vocabSize = cache.probs.length
     require(target >= 0 && target < vocabSize, s"target out of range: $target")
 
@@ -57,26 +62,26 @@ object LanguageModel:
       cache.probs(i) - t
     }.toVector
 
-    val dW2 = LinearAlgebra.outer(dLogits, cache.a1)
+    val dW2 = backend.outer(dLogits, cache.a1)
     val db2 = dLogits
 
-    val da1 = LinearAlgebra.matVecMul(p.W2.transposeView, dLogits)
+    val da1 = backend.matVecMul(p.W2.transposeView, dLogits)
 
-    val dz1 = applyActivationGrad(da1, cache.z1, activation)
+    val dz1 = applyActivationGrad(da1, cache.z1, activation, backend)
 
-    val dW1 = LinearAlgebra.outer(dz1, cache.x)
+    val dW1 = backend.outer(dz1, cache.x)
     val db1 = dz1
 
-    val dx = LinearAlgebra.matVecMul(p.W1.transposeView, dz1)
+    val dx = backend.matVecMul(p.W1.transposeView, dz1)
 
     val dE = scatterEmbeddingGrad(dx, cache.context, p.E.rows, p.E.cols)
 
     Grads(dE = dE, dW1 = dW1, db1 = db1, dW2 = dW2, db2 = db2)
 
-  private def applyActivationGrad(grad: Vec, z: Vec, activation: String): Vec =
+  private def applyActivationGrad(grad: Vec, z: Vec, activation: String, backend: ComputeBackend): Vec =
     activation.toLowerCase match
-      case "relu" => LinearAlgebra.hadamard(grad, LinearAlgebra.reluGrad(z))
-      case "tanh" => LinearAlgebra.hadamard(grad, LinearAlgebra.tanhGrad(z))
+      case "relu" => backend.hadamard(grad, backend.reluGrad(z))
+      case "tanh" => backend.hadamard(grad, backend.tanhGrad(z))
       case _      => throw new IllegalArgumentException(s"Unknown activation: $activation. Use 'relu' or 'tanh'.")
 
   private def scatterEmbeddingGrad(dx: Vec, context: Vector[Int], vocabSize: Int, embedDim: Int): Matrix =
@@ -159,9 +164,17 @@ object LanguageModel:
         db2 = scaleVec(g.db2)
       )
 
-  def trainStep(p: Params, ex: Example, lr: Double, l2: Double = 0.0, clipNorm: Option[Double] = None, activation: String = "tanh"): (Params, Double) =
-    val cache = forward(p, ex.context, activation)
-    val loss = lossFromCache(cache, ex.target)
-    val grads = backward(p, cache, ex.target, activation)
+  def trainStep(
+      p: Params,
+      ex: Example,
+      lr: Double,
+      l2: Double = 0.0,
+      clipNorm: Option[Double] = None,
+      activation: String = "tanh",
+      backend: ComputeBackend = CpuBackend.Default
+  ): (Params, Double) =
+    val cache = forward(p, ex.context, activation, backend)
+    val loss = lossFromCache(cache, ex.target, backend)
+    val grads = backward(p, cache, ex.target, activation, backend)
     val updated = update(p, grads, lr, l2 = l2, clipNorm = clipNorm)
     (updated, loss)

@@ -34,6 +34,26 @@ sbt "runMain app.Main chunk --input large-file.txt --lines 1000 --yes"
 sbt test
 ```
 
+### 6. Check GPU Status (Metal/JNI)
+
+```bash
+sbt "runMain app.Main gpu-info --precision fp64"
+```
+
+### 7. Benchmark CPU vs GPU Estimate
+
+```bash
+sbt "runMain app.Main benchmark --input data/corpus/example-corpus.txt --sample 2000 --precision fp32"
+```
+
+### Metal JNI Build (Optional)
+
+```bash
+metal-jni/scripts/build-metal-jni.sh
+```
+
+If JNI is not built/available, requesting `--backend gpu` will safely fall back to CPU and print diagnostics.
+
 ## How It Works
 
 **One persistent model** at `data/models/latest.ckpt` that gets smarter over time:
@@ -79,6 +99,9 @@ sbt "runMain app.Main train --input data.txt --preset balanced --yes"
 | `--contextSize N` | Words to look back (auto-uses existing model's setting) |
 | `--maxVocab N` | Max unique words (auto-uses existing model's setting) |
 | `--yes` | Auto-confirm without prompting |
+| `--backend NAME` | `cpu` or `gpu` (default: `gpu`) |
+| `--precision MODE` | `fp64` or `fp32` (default: `fp64`) |
+| `--gpuInfo` | Print Metal/JNI probe details before training |
 
 **Note:** When continuing training, the system automatically uses your existing model's architecture (context size, embedding dimensions, etc.). You only need to specify these when using `--fresh`.
 
@@ -93,6 +116,8 @@ sbt "runMain app.Main predict --context 'hello world' --topK 5"
 |--------|-------------|
 | `--context TEXT` | Words to continue from |
 | `--topK N` | Predictions to show (default: 5) |
+| `--backend NAME` | `cpu` or `gpu` (default: `gpu`) |
+| `--precision MODE` | `fp64` or `fp32` (default: `fp64`) |
 
 ### Chunk (Split Large Files)
 
