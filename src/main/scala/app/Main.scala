@@ -1062,7 +1062,7 @@ object Main:
         println("  7. GPU x fp64+fp32")
         println("  8. CPU+GPU x fp64")
         println("  9. CPU+GPU x fp32")
-        val choiceRaw = readTrimmedRequired("Select [1]: ", "benchmark combination")
+        val choiceRaw = Option(readLineWithPrompt("Select [1]: ")).map(_.trim).getOrElse("")
         val choiceIdx = CliHelpers.parseMenuChoice(choiceRaw, optionCount = 9, defaultIndex = 0).getOrElse(0)
         val (backendOpt, precisionOpt) = benchmarkSelection(choiceIdx)
         val combosPreview = benchmarkMatrix(backendOpt, precisionOpt).map { case (b, p) => s"$b/$p" }.mkString(", ")
