@@ -71,6 +71,26 @@ class MainConfigSuite extends FunSuite:
     assertEquals(Main.benchmarkSelection(8), (None, Some("fp32")))
   }
 
+  test("launcherCommandForSelection maps menu indexes to commands") {
+    assertEquals(Main.launcherCommandForSelection(0), Some("train"))
+    assertEquals(Main.launcherCommandForSelection(1), Some("predict"))
+    assertEquals(Main.launcherCommandForSelection(2), Some("benchmark"))
+    assertEquals(Main.launcherCommandForSelection(3), Some("chunk"))
+    assertEquals(Main.launcherCommandForSelection(4), Some("gpu-info"))
+    assertEquals(Main.launcherCommandForSelection(5), Some("help"))
+    assertEquals(Main.launcherCommandForSelection(6), Some("exit"))
+    assertEquals(Main.launcherCommandForSelection(7), None)
+  }
+
+  test("resolveLauncherCommand accepts defaults and valid choices") {
+    assertEquals(Main.resolveLauncherCommand(""), Some("train"))
+    assertEquals(Main.resolveLauncherCommand("1"), Some("train"))
+    assertEquals(Main.resolveLauncherCommand("2"), Some("predict"))
+    assertEquals(Main.resolveLauncherCommand("3"), Some("benchmark"))
+    assertEquals(Main.resolveLauncherCommand("7"), Some("exit"))
+    assertEquals(Main.resolveLauncherCommand("8"), None)
+  }
+
   test("utf8CopyPath inserts .utf8 before extension") {
     val got = Main.utf8CopyPath(java.nio.file.Path.of("data/corpus/bbc-all.txt"))
     assertEquals(got.toString, "data/corpus/bbc-all.utf8.txt")

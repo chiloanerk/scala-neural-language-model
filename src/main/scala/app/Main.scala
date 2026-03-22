@@ -21,6 +21,8 @@ object Main:
   private val ProjectRoot = Path.of(".").toAbsolutePath.normalize
   private val BenchmarkPreferenceOrder: Vector[(String, String)] =
     Vector(("gpu", "fp32"), ("gpu", "fp64"), ("cpu", "fp32"), ("cpu", "fp64"))
+  private val LauncherCommands: Vector[String] =
+    Vector("train", "predict", "benchmark", "chunk", "gpu-info", "help", "exit")
 
   private def displayPath(path: Path): String =
     val normalized = path.toAbsolutePath.normalize
@@ -231,6 +233,13 @@ object Main:
       BenchmarkPreferenceOrder.find(keys.contains)
         .orElse(ranked.sortBy { case (_, exPerSec) => -exPerSec }.headOption.map(_._1))
 
+  private[app] def launcherCommandForSelection(index: Int): Option[String] =
+    LauncherCommands.lift(index)
+
+  private[app] def resolveLauncherCommand(raw: String): Option[String] =
+    CliHelpers.parseMenuChoice(raw, optionCount = LauncherCommands.length, defaultIndex = 0)
+      .flatMap(launcherCommandForSelection)
+
   private def readTrimmedRequired(prompt: String, field: String): String =
     Option(readLineWithPrompt(prompt)) match
       case Some(v) => v.trim
@@ -242,8 +251,8 @@ object Main:
 
   def main(args: Array[String]): Unit =
     if args.isEmpty then
-      showMainMenu()
-      sys.exit(0)
+      runInteractiveLauncher()
+      return
 
     args(0) match
       case "train"   => runTrain(CliHelpers.parseArgs(args.drop(1)))
@@ -256,32 +265,53 @@ object Main:
         printUsage()
         sys.exit(1)
 
-  private def showMainMenu(): Unit =
+  private def runInteractiveLauncher(): Unit =
     val modelStatus = if Files.isRegularFile(ModelPath) then
       val size = Files.size(ModelPath) / 1024
       s"✓ Model exists (${size} KB)"
     else "✗ No model yet"
 
-    println(
-      s"""
-      |=== Scala Neural Language Model (NLM) ===
-      |
-      |Status: $modelStatus
-      |
-      |Commands:
-      |  train   - Train or continue training your model
-      |  predict - Predict next words
-      |  chunk   - Split large files into training chunks
-      |  gpu-info - Check Metal/JNI status
-      |  benchmark - Compare CPU/GPU throughput estimate
-      |  test    - Run built-in tests
-      |
-      |Quick start:
-      |  sbt "run train --input data/corpus/text.txt"
-      |  sbt "run predict --context 'the cat'"
-      |  sbt "run chunk --input large-file.txt --lines 1000"
-      |  sbt "run gpu-info --precision fp32"
-      |""".stripMargin)
+    var keepRunning = true
+    while keepRunning do
+      var resolved: Option[String] = None
+      var canceled = false
+      while resolved.isEmpty && !canceled do
+        println(s"\n=== Scala Neural Language Model (NLM) ===")
+        println(s"Status: $modelStatus\n")
+        println("Choose an action:")
+        println("  1. Train (interactive)")
+        println("  2. Predict (interactive)")
+        println("  3. Benchmark (interactive)")
+        println("  4. Chunk text files")
+        println("  5. GPU info")
+        println("  6. Help / CLI flags")
+        println("  7. Exit")
+        println()
+        Option(readLineWithPrompt("Select [1]: ")) match
+          case None =>
+            canceled = true
+            println("\nNo interactive input available. Showing help instead.")
+            printUsage()
+          case Some(rawInput) =>
+            resolveLauncherCommand(rawInput.trim) match
+              case Some(command) => resolved = Some(command)
+              case None =>
+                println(s"Invalid selection. Please choose 1-${LauncherCommands.length}.")
+
+      resolved match
+        case Some("train")     => runTrain(Map.empty)
+        case Some("predict")   => runPredict(Map.empty)
+        case Some("benchmark") => runBenchmark(Map.empty)
+        case Some("chunk")     => runChunker(Map.empty)
+        case Some("gpu-info")  => runGpuInfo(Map.empty)
+        case Some("help")      => printUsage()
+        case Some("exit")      =>
+          println("Exiting.")
+          keepRunning = false
+        case _ =>
+          keepRunning = false
+
+      if canceled then keepRunning = false
 
   private def runTrain(flags: Map[String, String]): Unit =
     println("\n=== Training ===\n")
