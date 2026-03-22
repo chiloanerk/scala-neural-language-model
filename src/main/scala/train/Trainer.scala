@@ -83,6 +83,7 @@ final case class TrainResult(
 )
 
 object Trainer:
+  private final case class InstalledSignalHandlers(previous: Map[String, SignalHandler])
 
   final case class TrainingPhase(
       label: String,
@@ -166,24 +167,33 @@ object Trainer:
       cancelRequested: AtomicBoolean,
       currentEpoch: AtomicInteger,
       display: TrainingDisplay
-  ): Option[SignalHandler] =
+  ): Option[InstalledSignalHandlers] =
     try
       val handler = new SignalHandler:
         override def handle(sig: Signal): Unit =
           if cancelRequested.get() then
-            System.err.println("\nSecond interrupt received. Exiting immediately.")
+            System.err.println(s"\nSecond ${sig.getName} received. Exiting immediately.")
             System.exit(130)
           else
             cancelRequested.set(true)
             display.onCancellationRequested(currentEpoch.get())
-      Some(Signal.handle(new Signal("INT"), handler))
+      val previous = scala.collection.mutable.Map.empty[String, SignalHandler]
+      Vector("INT", "TERM").foreach { name =>
+        try
+          previous(name) = Signal.handle(new Signal(name), handler)
+        catch
+          case NonFatal(_) => ()
+      }
+      if previous.nonEmpty then Some(InstalledSignalHandlers(previous.toMap)) else None
     catch
       case NonFatal(_) => None
 
-  private def restoreInterruptHandler(previous: Option[SignalHandler]): Unit =
-    previous.foreach { h =>
-      try Signal.handle(new Signal("INT"), h)
-      catch case NonFatal(_) => ()
+  private def restoreInterruptHandler(previous: Option[InstalledSignalHandlers]): Unit =
+    previous.foreach { installed =>
+      installed.previous.foreach { case (name, handler) =>
+        try Signal.handle(new Signal(name), handler)
+        catch case NonFatal(_) => ()
+      }
     }
 
   def train(initial: Params, trainSet: Vector[Example], valSet: Vector[Example], cfg: TrainConfig): TrainResult =

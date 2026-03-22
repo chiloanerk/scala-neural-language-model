@@ -178,14 +178,27 @@ object Main:
       presets(1)
     }
 
+    val autoConfirm = flags.get("yes").exists(CliHelpers.isTruthy)
     val backend = BackendSelector.normalizeBackend(flags.getOrElse("backend", "gpu"))
-    val precision = BackendSelector.normalizePrecision(flags.getOrElse("precision", defaultPrecisionForBackend(backend)))
+    val precision = flags.get("precision") match
+      case Some(raw) => BackendSelector.normalizePrecision(raw)
+      case None =>
+        val defaultPrecision = defaultPrecisionForBackend(backend)
+        if autoConfirm then defaultPrecision
+        else
+          println("\nChoose numeric precision:")
+          println("  1. fp64 - highest numerical stability (slower)")
+          println("  2. fp32 - faster/lower memory (recommended on GPU)")
+          val defaultIdx = if defaultPrecision == "fp32" then 1 else 0
+          val raw = readTrimmedRequired(s"Select precision [${defaultIdx + 1}]: ", "select precision")
+          CliHelpers.parseMenuChoice(raw, optionCount = 2, defaultIndex = defaultIdx).getOrElse(defaultIdx) match
+            case 1 => "fp32"
+            case _ => "fp64"
     val learningRate = flags.get("lr").flatMap(_.toDoubleOption).getOrElse(preset.learningRate)
     val lrDecay = flags.get("lrDecay").flatMap(_.toDoubleOption).getOrElse(1.0)
     val batchSize = flags.get("batchSize").flatMap(_.toIntOption).getOrElse(0)
     val prefetch = flags.get("prefetch").flatMap(_.toIntOption).getOrElse(1)
     val profileGpu = flags.get("profileGpu").exists(CliHelpers.isTruthy)
-    val autoConfirm = flags.get("yes").exists(CliHelpers.isTruthy)
     val replayFlagsProvided = flags.contains("replayRatio") || flags.contains("replayBufferSize") || flags.contains("replayBufferPath")
     val replayFileDefault = ReplayPath
     val replayFileExists = Files.isRegularFile(replayFileDefault)
