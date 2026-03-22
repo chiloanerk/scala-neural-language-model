@@ -16,8 +16,10 @@ import java.util.Locale
 import scala.io.StdIn
 import scala.jdk.CollectionConverters._
 import scala.util.Using
+import scala.util.control.NoStackTrace
 
 object Main:
+  private case object BackToLauncher extends RuntimeException("back-to-launcher") with NoStackTrace
   private val ProjectRoot = Path.of(".").toAbsolutePath.normalize
   private val BenchmarkPreferenceOrder: Vector[(String, String)] =
     Vector(("gpu", "fp32"), ("gpu", "fp64"), ("cpu", "fp32"), ("cpu", "fp64"))
@@ -61,6 +63,27 @@ object Main:
     println(prompt)
     Console.out.flush()
     StdIn.readLine()
+
+  private def isBackToken(raw: String): Boolean =
+    val t = raw.trim.toLowerCase
+    t == "b" || t == "back"
+
+  private enum MenuPick:
+    case Choice(index: Int)
+    case Back
+
+  private def parseMenuPick(raw: String, optionCount: Int, defaultIndex: Int, allowBack: Boolean = false): Option[MenuPick] =
+    if allowBack && isBackToken(raw) then Some(MenuPick.Back)
+    else CliHelpers.parseMenuChoice(raw, optionCount, defaultIndex).map(MenuPick.Choice(_))
+
+  private def promptYesNoOrBack(label: String, default: Boolean): Option[Boolean] =
+    val defaultStr = if default then "Y/n" else "y/N"
+    val raw = readLineWithPrompt(s"$label [$defaultStr, b=back]: ")
+    if raw == null then
+      println("\nNo interactive input available for confirmation; canceling for safety.")
+      Some(false)
+    else if isBackToken(raw) then None
+    else Some(CliHelpers.parseYesNo(raw, default))
 
   private def defaultPrecisionForBackend(backend: String): String =
     "fp64"
@@ -245,7 +268,7 @@ object Main:
       case Some(v) => v.trim
       case None =>
         println(s"\nNo interactive input available for '$field'.")
-        println("Run with explicit flags for non-interactive mode (and add --yes to auto-confirm).")
+        println("Tip: run with explicit flags in non-interactive mode (add --yes to auto-confirm).")
         sys.exit(1)
         ""
 
@@ -255,11 +278,15 @@ object Main:
       return
 
     args(0) match
-      case "train"   => runTrain(CliHelpers.parseArgs(args.drop(1)))
+      case "train"   =>
+        try runTrain(CliHelpers.parseArgs(args.drop(1)))
+        catch case BackToLauncher => println("Canceled and returned.")
       case "predict" => runPredict(CliHelpers.parseArgs(args.drop(1)))
       case "chunk"   => runChunker(CliHelpers.parseArgs(args.drop(1)))
       case "gpu-info" => runGpuInfo(CliHelpers.parseArgs(args.drop(1)))
-      case "benchmark" => runBenchmark(CliHelpers.parseArgs(args.drop(1)))
+      case "benchmark" =>
+        try runBenchmark(CliHelpers.parseArgs(args.drop(1)))
+        catch case BackToLauncher => println("Canceled and returned.")
       case "test"    => TestRunner.main(Array.empty)
       case _ =>
         printUsage()
@@ -278,13 +305,14 @@ object Main:
       while resolved.isEmpty && !canceled do
         println(s"\n=== Scala Neural Language Model (NLM) ===")
         println(s"Status: $modelStatus\n")
-        println("Choose an action:")
-        println("  1. Train (interactive)")
-        println("  2. Predict (interactive)")
-        println("  3. Benchmark (interactive)")
+        println("Tip: press Enter to accept the default in [brackets].")
+        println("What would you like to do?")
+        println("  1. Train model (guided)")
+        println("  2. Predict next words")
+        println("  3. Run benchmark")
         println("  4. Chunk text files")
-        println("  5. GPU info")
-        println("  6. Help / CLI flags")
+        println("  5. Check GPU info")
+        println("  6. Help / command reference")
         println("  7. Exit")
         println()
         Option(readLineWithPrompt("Select [1]: ")) match
@@ -296,15 +324,32 @@ object Main:
             resolveLauncherCommand(rawInput.trim) match
               case Some(command) => resolved = Some(command)
               case None =>
-                println(s"Invalid selection. Please choose 1-${LauncherCommands.length}.")
+                println(s"Invalid selection. Enter a number from 1 to ${LauncherCommands.length}.")
 
       resolved match
-        case Some("train")     => runTrain(Map.empty)
-        case Some("predict")   => runPredict(Map.empty)
-        case Some("benchmark") => runBenchmark(Map.empty)
-        case Some("chunk")     => runChunker(Map.empty)
-        case Some("gpu-info")  => runGpuInfo(Map.empty)
-        case Some("help")      => printUsage()
+        case Some("train") =>
+          try runTrain(Map.empty)
+          catch case BackToLauncher => println("Returning to main menu.")
+          println("Quick actions: 1) Train  2) Predict  3) Benchmark  7) Exit")
+        case Some("predict") =>
+          try runPredict(Map.empty)
+          catch case BackToLauncher => println("Returning to main menu.")
+          println("Quick actions: 1) Train  2) Predict  3) Benchmark  7) Exit")
+        case Some("benchmark") =>
+          try runBenchmark(Map.empty)
+          catch case BackToLauncher => println("Returning to main menu.")
+          println("Quick actions: 1) Train  2) Predict  3) Benchmark  7) Exit")
+        case Some("chunk") =>
+          try runChunker(Map.empty)
+          catch case BackToLauncher => println("Returning to main menu.")
+          println("Quick actions: 1) Train  2) Predict  3) Benchmark  7) Exit")
+        case Some("gpu-info") =>
+          try runGpuInfo(Map.empty)
+          catch case BackToLauncher => println("Returning to main menu.")
+          println("Quick actions: 1) Train  2) Predict  3) Benchmark  7) Exit")
+        case Some("help") =>
+          printUsage()
+          println("Quick actions: 1) Train  2) Predict  3) Benchmark  7) Exit")
         case Some("exit")      =>
           println("Exiting.")
           keepRunning = false
@@ -315,6 +360,8 @@ object Main:
 
   private def runTrain(flags: Map[String, String]): Unit =
     println("\n=== Training ===\n")
+    if flags.isEmpty then
+      println("Tip: press Enter to accept defaults shown in [brackets]. Type 'b' to go back where available.\n")
     val observability = parseObservabilitySettings(flags)
     val runStartMs = System.currentTimeMillis()
     val memoryStart = MemoryProbe.snapshot(runStartMs)
@@ -354,12 +401,25 @@ object Main:
     val actuallyFresh = if hasExistingModel && !freshTraining && inputFlag.isEmpty && inputsFlag.isEmpty && !autoResumeInterrupt then
       println(s"Found existing model: ${displayPath(activeModelPath)} (${Files.size(activeModelPath) / 1024} KB)")
       println()
-      println("Choose action:")
-      println("  1. Continue training (default)")
-      println("  2. Start fresh (new model, ignores existing)")
+      println("How do you want to proceed?")
+      println("  1. Continue training (default, keeps current model)")
+      println("  2. Start fresh (new model from scratch)")
+      println("  b. Back to main menu")
       println()
-      val raw = readTrimmedRequired("Select [1]: ", "select action")
-      CliHelpers.parseMenuChoice(raw, optionCount = 2, defaultIndex = 0).contains(1)
+      var actionFresh = false
+      var resolved = false
+      while !resolved do
+        val raw = readTrimmedRequired("Select [1]: ", "select action")
+        parseMenuPick(raw, optionCount = 2, defaultIndex = 0, allowBack = true) match
+          case Some(MenuPick.Choice(idx)) =>
+            actionFresh = idx == 1
+            resolved = true
+          case Some(MenuPick.Back) =>
+            println("Returning to main menu.")
+            throw BackToLauncher
+          case None =>
+            println("Please choose 1 or 2, or type 'b' to go back.")
+      actionFresh
     else if autoResumeInterrupt then
       println("Continuing from interrupt snapshot (auto-resume).\n")
       false
@@ -391,18 +451,29 @@ object Main:
       None
 
     val presetName = effectiveFlags.getOrElse("preset", {
-      println("\nChoose training quality:")
+      println("\nPick a training preset:")
       presets.zipWithIndex.foreach { case (p, idx) =>
         println(s"  ${idx + 1}. ${p.name.capitalize} - ${p.description} (${p.epochs} epochs, patience=${p.patience})")
       }
-      val raw = readTrimmedRequired("\nSelect preset [2]: ", "select preset")
-      val idx = CliHelpers.parseMenuChoice(raw, optionCount = presets.length, defaultIndex = 1).getOrElse(1)
-      presets(idx).name
+      println("  b. Back to main menu")
+      var selectedPreset: Option[String] = None
+      while selectedPreset.isEmpty do
+        val raw = readTrimmedRequired("\nSelect preset [2]: ", "select preset")
+        parseMenuPick(raw, optionCount = presets.length, defaultIndex = 1, allowBack = true) match
+          case Some(MenuPick.Choice(idx)) =>
+            selectedPreset = Some(presets(idx).name)
+          case Some(MenuPick.Back) =>
+            println("Returning to main menu.")
+            throw BackToLauncher
+          case None =>
+            println(s"Please choose 1-${presets.length}, or type 'b' to go back.")
+      selectedPreset.get
     })
     val preset = presets.find(_.name == presetName).getOrElse {
-      println(s"Unknown preset '$presetName'. Using 'balanced'.")
+      println(s"Unknown preset '$presetName'. Using Balanced.")
       presets(1)
     }
+    if !effectiveFlags.contains("preset") then println(s"Selected preset: ${preset.name.capitalize}")
 
     val autoConfirm = flags.get("yes").exists(CliHelpers.isTruthy)
     val backend = BackendSelector.normalizeBackend(effectiveFlags.getOrElse("backend", "gpu"))
@@ -413,13 +484,23 @@ object Main:
         if autoConfirm then defaultPrecision
         else
           println("\nChoose numeric precision:")
-          println("  1. fp64 - highest numerical stability (slower)")
-          println("  2. fp32 - faster/lower memory (recommended on GPU)")
+          println("  1. fp64 - most stable, slower")
+          println("  2. fp32 - faster, lower memory (recommended on GPU)")
+          println("  b. Back to main menu")
           val defaultIdx = if defaultPrecision == "fp32" then 1 else 0
-          val raw = readTrimmedRequired(s"Select precision [${defaultIdx + 1}]: ", "select precision")
-          CliHelpers.parseMenuChoice(raw, optionCount = 2, defaultIndex = defaultIdx).getOrElse(defaultIdx) match
-            case 1 => "fp32"
-            case _ => "fp64"
+          var selectedPrecision: Option[String] = None
+          while selectedPrecision.isEmpty do
+            val raw = readTrimmedRequired(s"Select precision [${defaultIdx + 1}]: ", "select precision")
+            parseMenuPick(raw, optionCount = 2, defaultIndex = defaultIdx, allowBack = true) match
+              case Some(MenuPick.Choice(idx)) =>
+                selectedPrecision = Some(if idx == 1 then "fp32" else "fp64")
+              case Some(MenuPick.Back) =>
+                println("Returning to main menu.")
+                throw BackToLauncher
+              case None =>
+                println("Please choose 1 or 2, or type 'b' to go back.")
+          selectedPrecision.get
+    if !effectiveFlags.contains("precision") then println(s"Selected precision: $precision")
     val learningRate = effectiveFlags.get("lr").flatMap(_.toDoubleOption).getOrElse(preset.learningRate)
     val lrDecay = effectiveFlags.get("lrDecay").flatMap(_.toDoubleOption).getOrElse(1.0)
     val batchSize = effectiveFlags.get("batchSize").flatMap(_.toIntOption).getOrElse(0)
@@ -443,34 +524,48 @@ object Main:
         if replayBufferSize <= 0 then replayBufferSize = 10000
 
         if !autoConfirm then
-          println("\nReplay options:")
+          println("\nReplay settings:")
           if replayFileExists then println(s"  Found replay memory: ${displayPath(replayFileDefault)}")
-          else println("  No replay memory file found yet; one can be created after this run.")
-          println("  What replay does: mixes old-domain examples into new training to reduce forgetting.")
+          else println("  No replay memory file found yet. One can be created after this run.")
+          println("  What replay does: mixes older examples into new training to reduce forgetting.")
           println("  Replay ratio guide:")
           println("    - lower (0.1-0.2): faster training, weaker retention")
-          println("    - medium (0.3): balanced speed vs retention (recommended)")
-          println("    - higher (0.4-0.6): stronger retention, slower adaptation/training")
+          println("    - medium (0.3): balanced speed and retention (recommended)")
+          println("    - higher (0.4-0.6): stronger retention, slower training")
           println("  1. Use replay defaults (recommended)")
-          println("  2. Disable replay for this run (fastest, but higher forgetting risk)")
+          println("  2. Disable replay for this run (fastest, higher forgetting risk)")
           println("  3. Customize replay settings")
-          val choiceRaw = readTrimmedRequired("Select [1]: ", "select replay option")
-          CliHelpers.parseMenuChoice(choiceRaw, optionCount = 3, defaultIndex = 0).getOrElse(0) match
-            case 1 =>
-              replayRatio = 0.0
-              replayBufferSize = 0
-              replayBufferPath = None
-            case 2 =>
-              val ratioRaw = readTrimmedRequired(f"Replay ratio [${replayRatio}%.2f]: ", "replay ratio")
-              replayRatio = if ratioRaw.isEmpty then replayRatio else ratioRaw.toDoubleOption.getOrElse(replayRatio)
-              val sizeRaw = readTrimmedRequired(s"Replay buffer size [$replayBufferSize]: ", "replay buffer size")
-              replayBufferSize = if sizeRaw.isEmpty then replayBufferSize else sizeRaw.toIntOption.getOrElse(replayBufferSize)
-              if replayFileExists then
-                val useExisting = promptYesNo(s"Use existing replay file ($replayFileDefault)?", true)
-                replayBufferPath = if useExisting then Some(replayFileDefault) else None
-            case _ => ()
+          println("  b. Back to main menu")
+          var replayChosen = false
+          while !replayChosen do
+            val choiceRaw = readTrimmedRequired("Select [1]: ", "select replay option")
+            parseMenuPick(choiceRaw, optionCount = 3, defaultIndex = 0, allowBack = true) match
+              case Some(MenuPick.Choice(choiceIdx)) =>
+                choiceIdx match
+                  case 1 =>
+                    replayRatio = 0.0
+                    replayBufferSize = 0
+                    replayBufferPath = None
+                    println("Replay disabled for this run.")
+                  case 2 =>
+                    val ratioRaw = readTrimmedRequired(f"Replay ratio [${replayRatio}%.2f]: ", "replay ratio")
+                    replayRatio = if ratioRaw.isEmpty then replayRatio else ratioRaw.toDoubleOption.getOrElse(replayRatio)
+                    val sizeRaw = readTrimmedRequired(s"Replay buffer size [$replayBufferSize]: ", "replay buffer size")
+                    replayBufferSize = if sizeRaw.isEmpty then replayBufferSize else sizeRaw.toIntOption.getOrElse(replayBufferSize)
+                    if replayFileExists then
+                      val useExisting = promptYesNo(s"Use existing replay file ($replayFileDefault)?", true)
+                      replayBufferPath = if useExisting then Some(replayFileDefault) else None
+                    println(f"Replay customized: ratio=$replayRatio%.2f, bufferSize=$replayBufferSize")
+                  case _ =>
+                    println(f"Replay defaults selected: ratio=$replayRatio%.2f, bufferSize=$replayBufferSize")
+                replayChosen = true
+              case Some(MenuPick.Back) =>
+                println("Returning to main menu.")
+                throw BackToLauncher
+              case None =>
+                println("Please choose 1-3, or type 'b' to go back.")
       else if actuallyFresh && !autoConfirm then
-        val enableReplay = promptYesNo("Enable replay memory for this fresh run and future continual training?", true)
+        val enableReplay = promptYesNo("Enable replay memory for this fresh run and future training?", true)
         if enableReplay then
           replayRatio = 0.3
           replayBufferSize = 10000
@@ -486,8 +581,20 @@ object Main:
           println(s"\nUsing existing model architecture: context=${cfg.contextSize}")
           cfg.contextSize
         case None =>
-          val raw = readTrimmedRequired("\nContext size (words to look back) [3]: ", "context size")
-          raw.toIntOption.getOrElse(3)
+          var selected: Option[Int] = None
+          while selected.isEmpty do
+            val raw = readTrimmedRequired("\nContext size (how many previous words to use) [3]: ", "context size")
+            if isBackToken(raw) then
+              println("Returning to main menu.")
+              throw BackToLauncher
+            selected = raw.toIntOption match
+              case Some(v) if v >= 1 => Some(v)
+              case _ if raw.isEmpty  => Some(3)
+              case _ =>
+                println("Please enter a number >= 1, or type 'b' to go back.")
+                None
+          println(s"Selected context size: ${selected.get}")
+          selected.get
     }
     val maxVocab = effectiveFlags.get("maxVocab").map(_.toInt).getOrElse {
       existingCfg match
@@ -495,8 +602,20 @@ object Main:
           println(s"Using existing model vocabulary size: ${cfg.vocabSize}")
           cfg.vocabSize
         case None =>
-          val raw = readTrimmedRequired("Max vocabulary (unique words) [3000]: ", "max vocabulary")
-          raw.toIntOption.getOrElse(3000)
+          var selected: Option[Int] = None
+          while selected.isEmpty do
+            val raw = readTrimmedRequired("Max vocabulary (how many unique words to keep) [3000]: ", "max vocabulary")
+            if isBackToken(raw) then
+              println("Returning to main menu.")
+              throw BackToLauncher
+            selected = raw.toIntOption match
+              case Some(v) if v >= 100 => Some(v)
+              case _ if raw.isEmpty    => Some(3000)
+              case _ =>
+                println("Please enter a number >= 100, or type 'b' to go back.")
+                None
+          println(s"Selected max vocabulary: ${selected.get}")
+          selected.get
     }
 
     val rawInputWeights = effectiveFlags.get("inputWeights")
@@ -547,11 +666,16 @@ object Main:
     val confirm = if autoConfirm then
       println("Auto-confirming (--yes flag)")
       true
-    else promptYesNo("Start training?", true)
+    else
+      promptYesNoOrBack("Start training now?", true) match
+        case Some(v) => v
+        case None =>
+          println("Returning to main menu.")
+          throw BackToLauncher
 
     if !confirm then
       println("Training canceled.")
-      sys.exit(0)
+      return
 
     println()
 
@@ -818,7 +942,8 @@ object Main:
     val (recommended, other) = CliHelpers.classifyTrainingFiles(candidatesWithLines.map(_._1))
     val orderedPaths = recommended ++ other
     val byPath = candidatesWithLines.map { case (p, lines, size) => p -> (lines, size) }.toMap
-    println("Found text files (excluding chunks):")
+    println("Found text files you can train on (chunk files excluded):")
+    println("Tip: press Enter to choose the default [1]. Type 'b' to go back.\n")
     if recommended.nonEmpty then println("  Recommended training files:")
     recommended.zipWithIndex.foreach { case (p, idx) =>
       val (lines, size) = byPath(p)
@@ -835,9 +960,14 @@ object Main:
     var selected: Option[Path] = None
     while selected.isEmpty do
       val raw = readTrimmedRequired(s"Choose file number [1]: ", "choose training file")
-      CliHelpers.parseMenuChoice(raw, optionCount = orderedPaths.length, defaultIndex = 0) match
-        case Some(idx) => selected = Some(orderedPaths(idx))
-        case None      => println(s"Please choose 1-${orderedPaths.length}.")
+      parseMenuPick(raw, optionCount = orderedPaths.length, defaultIndex = 0, allowBack = true) match
+        case Some(MenuPick.Choice(idx)) => selected = Some(orderedPaths(idx))
+        case Some(MenuPick.Back) =>
+          println("Returning to main menu.")
+          throw BackToLauncher
+        case None =>
+          println(s"Please choose 1-${orderedPaths.length}, or type 'b' to go back.")
+    println(s"Selected training file: ${displayPath(selected.get)}")
     selected.get
 
   private def parseInputWeights(raw: Option[String], count: Int): Vector[Double] =
@@ -879,7 +1009,7 @@ object Main:
   private def maybeCreateUtf8Copy(path: Path): Option[Path] =
     println(s"UTF-8 read failed for ${displayPath(path)}.")
     val suggested = utf8CopyPath(path)
-    Option(readLineWithPrompt("Create UTF-8 normalized copy and use it for this run? [Y/n]: ")) match
+    Option(readLineWithPrompt("Create a UTF-8 normalized copy and use it for this run? [Y/n]: ")) match
       case None =>
         println("No interactive input available; using system default encoding for this run.")
         None
@@ -915,6 +1045,8 @@ object Main:
 
   private def runChunker(flags: Map[String, String]): Unit =
     println("\n=== File Chunker ===\n")
+    if flags.isEmpty then
+      println("Tip: press Enter to accept defaults shown in [brackets].\n")
 
     // Get input file
     val inputPath = flags.get("input") match
@@ -936,10 +1068,10 @@ object Main:
         
         var selected: Option[Path] = None
         while selected.isEmpty do
-          val raw = readTrimmedRequired("Choose file number: ", "choose file number")
+          val raw = readTrimmedRequired("Choose file number [1]: ", "choose file number")
           CliHelpers.parseMenuChoice(raw, optionCount = candidates.length, defaultIndex = 0) match
             case Some(idx) => selected = Some(candidates(idx))
-            case None      => println(s"Please choose 1-${candidates.length}.")
+            case None      => println(s"Please choose a number from 1 to ${candidates.length}.")
         selected.get
 
     require(Files.isRegularFile(inputPath), s"Input file not found: $inputPath")
@@ -1089,15 +1221,26 @@ object Main:
     val effectiveFlags =
       if flags.nonEmpty then flags
       else
-        println("No benchmark flags provided. Running interactive benchmark setup.")
+        println("No benchmark flags provided. Starting guided benchmark setup.")
+        println("Tip: press Enter at any prompt to accept the default value.")
         val defaultInput = "data/corpus/example-corpus.txt"
         val inputRaw = Option(readLineWithPrompt(s"Input file [$defaultInput]: ")).map(_.trim).getOrElse("")
         val input = if inputRaw.isEmpty then defaultInput else inputRaw
 
         def promptInt(label: String, default: Int, min: Int): Int =
           val raw = Option(readLineWithPrompt(s"$label [$default]: ")).map(_.trim).getOrElse("")
-          val chosen = if raw.isEmpty then default else raw.toIntOption.getOrElse(default)
-          math.max(min, chosen)
+          val parsed =
+            if raw.isEmpty then default
+            else
+              raw.toIntOption match
+                case Some(v) => v
+                case None =>
+                  println(s"Invalid input '$raw'. Using default $default.")
+                  default
+          val chosen = math.max(min, parsed)
+          if chosen != parsed then println(s"Adjusted $label to minimum $min.")
+          println(s"Selected $label: $chosen")
+          chosen
 
         val sample = promptInt("Sample examples", 2000, 1)
         val contextSize = promptInt("Context size", 3, 1)
@@ -1105,8 +1248,9 @@ object Main:
         val batchSize = promptInt("Batch size override (0=auto)", 0, 0)
         val activationRaw = Option(readLineWithPrompt("Activation [tanh]: ")).map(_.trim.toLowerCase).getOrElse("")
         val activation = if activationRaw == "relu" then "relu" else "tanh"
+        println(s"Selected activation: $activation")
 
-        println("\nBenchmark combinations:")
+        println("\nChoose benchmark combinations:")
         println("  1. CPU+GPU x fp64+fp32 (full matrix)")
         println("  2. CPU fp64")
         println("  3. CPU fp32")
@@ -1116,12 +1260,21 @@ object Main:
         println("  7. GPU x fp64+fp32")
         println("  8. CPU+GPU x fp64")
         println("  9. CPU+GPU x fp32")
+        println("  b. Back to main menu")
         val choiceRaw = Option(readLineWithPrompt("Select [1]: ")).map(_.trim).getOrElse("")
-        val choiceIdx = CliHelpers.parseMenuChoice(choiceRaw, optionCount = 9, defaultIndex = 0).getOrElse(0)
+        val choiceIdx = parseMenuPick(choiceRaw, optionCount = 9, defaultIndex = 0, allowBack = true) match
+          case Some(MenuPick.Choice(idx)) => idx
+          case Some(MenuPick.Back) =>
+            println("Returning to main menu.")
+            throw BackToLauncher
+          case None =>
+            println("Invalid selection. Using default 1.")
+            0
         val (backendOpt, precisionOpt) = benchmarkSelection(choiceIdx)
         val combosPreview = benchmarkMatrix(backendOpt, precisionOpt).map { case (b, p) => s"$b/$p" }.mkString(", ")
+        println(s"Selected combinations: $combosPreview")
 
-        val metricsEnabledPrompt = promptYesNo("Enable metrics flow and report output (--metrics)?", true)
+        val metricsEnabledPrompt = promptYesNo("Enable metrics logging and report output (--metrics)?", true)
         val runLabelRaw = Option(readLineWithPrompt("Run label (optional): ")).map(_.trim).getOrElse("")
         val compareDefault = "latest"
         val compareToRaw = Option(readLineWithPrompt(s"Compare to [$compareDefault]: ")).map(_.trim).getOrElse("")
@@ -1137,9 +1290,14 @@ object Main:
         if metricsEnabledPrompt then
           println(s"  compareTo=$compareTo regressionWarnPct=${formatDecimal(regressionWarnPct, 2)}")
         if runLabelRaw.nonEmpty then println(s"  runLabel=$runLabelRaw")
-        if !promptYesNo("Start benchmark?", true) then
-          println("Canceled.")
-          return
+        promptYesNoOrBack("Start benchmark now?", true) match
+          case None =>
+            println("Returning to main menu.")
+            throw BackToLauncher
+          case Some(false) =>
+            println("Benchmark canceled.")
+            return
+          case Some(true) => ()
 
         val mutable = scala.collection.mutable.LinkedHashMap(
           "input" -> input,

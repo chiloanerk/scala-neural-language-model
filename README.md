@@ -47,6 +47,8 @@ sbt "run"
 
 If sbt asks for a main class, choose `app.Main`.
 To skip that prompt, run `sbt "run ..."` directly.
+The launcher stays open after each action and returns to the menu until you choose `Exit`.
+In guided menus (`run`, `train`, `benchmark`, `chunk`), pressing Enter accepts the `[default]` value.
 
 ### 2) Train (interactive)
 
@@ -159,6 +161,7 @@ Notes:
   - fresh runs ask whether to enable replay memory for future continual training
   - continue runs show replay options (defaults, disable, or customize ratio/buffer)
   - `replayRatio=0.3` is the default/recommended balance
+- Interactive `train` supports `b` / `back` on setup prompts to return to the main launcher.
 
 Interactive flow (`sbt "run train"`):
 
@@ -169,6 +172,7 @@ Interactive flow (`sbt "run train"`):
 5. Context size / max vocab for fresh architecture
 6. Summary + `Start training?` confirmation
 7. Optional UTF-8 normalization prompt if decode fails
+8. After completion/cancel, launcher remains open for next action
 
 ### `predict`
 
@@ -209,6 +213,7 @@ sbt "run benchmark --input data/corpus/example-corpus.txt --sample 2000"
 ```
 
 `sbt "run benchmark"` (with no flags) launches an interactive setup that lets you pick backend/precision combinations and optional metrics reporting options before running.
+Interactive `benchmark` supports `b` / `back` at menu checkpoints to return to the main launcher.
 
 Options:
 
