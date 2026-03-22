@@ -926,7 +926,7 @@ object Main:
     RunObservability.persistAndReport(runMetrics, observability)
     println()
     println("Continue with: sbt \"run train --inputs <more1.txt,more2.txt>\"")
-    println("Or predict:    sbt \"run predict --context 'your text'\"")
+    println("Or predict:    sbt 'run predict --context \"your text\"'")
 
   private def selectTrainingInputInteractively(): Path =
     val candidates = discoverTextFiles(Path.of(".").toAbsolutePath.normalize, maxDepth = 6)
@@ -1635,5 +1635,5 @@ object Main:
         |  sbt "run train --input data/corpus/text.txt"
         |  sbt "run train --inputs data/a.txt,data/b.txt --inputWeights 0.7,0.3 --replayRatio 0.3 --replayBufferSize 10000"
         |  sbt "run chunk --input large-file.txt --lines 1000"
-        |  sbt "run predict --context 'the cat sat' --topK 5"
+        |  sbt 'run predict --context "the cat sat" --topK 5'
 |""".stripMargin)

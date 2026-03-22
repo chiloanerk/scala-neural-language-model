@@ -71,7 +71,7 @@ sbt "run train --inputs data/corpus/a.txt,data/corpus/b.txt --inputWeights 0.7,0
 ### 4) Predict
 
 ```bash
-sbt "run predict --context 'the company' --topK 5"
+sbt 'run predict --context "the company" --topK 5'
 ```
 
 ### 5) Benchmark (runs full matrix by default)
@@ -177,7 +177,7 @@ Interactive flow (`sbt "run train"`):
 ### `predict`
 
 ```bash
-sbt "run predict --context 'your text' --topK 5"
+sbt 'run predict --context "your text" --topK 5'
 ```
 
 Options:
