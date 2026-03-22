@@ -91,22 +91,46 @@ object Main:
       displayPathFn: Path => String = p => p.toString
   ): String =
     val lines = scala.collection.mutable.ArrayBuffer.empty[String]
+    val matrixSorted = runMetrics.benchmarkMatrix.sortBy(c => (c.backend, c.precision))
+    val matrixByKey = runMetrics.benchmarkMatrix.map(c => (c.backend, c.precision) -> c).toMap
+    val preferredCell =
+      BenchmarkPreferenceOrder.collectFirst { case key if matrixByKey.contains(key) => matrixByKey(key) }
+        .orElse(runMetrics.benchmarkMatrix.maxByOption(_.exPerSec))
+
+    def speedupByKeys(numerator: (String, String), denominator: (String, String)): Option[Double] =
+      for
+        num <- matrixByKey.get(numerator)
+        den <- matrixByKey.get(denominator)
+        if den.exPerSec > 0.0
+      yield num.exPerSec / den.exPerSec
+
+    val relativeSpeedups = Vector(
+      speedupByKeys(("gpu", "fp32"), ("cpu", "fp32")).map(v => s"gpu fp32 vs cpu fp32: ${formatDecimal(v)}x"),
+      speedupByKeys(("gpu", "fp64"), ("cpu", "fp64")).map(v => s"gpu fp64 vs cpu fp64: ${formatDecimal(v)}x"),
+      speedupByKeys(("gpu", "fp32"), ("gpu", "fp64")).map(v => s"fp32 vs fp64 on gpu: ${formatDecimal(v)}x"),
+      speedupByKeys(("cpu", "fp32"), ("cpu", "fp64")).map(v => s"fp32 vs fp64 on cpu: ${formatDecimal(v)}x")
+    ).flatten
+
     lines += "=== Metrics Report (benchmark --metrics) ==="
     lines += s"Run ID: ${runMetrics.runId}"
     lines += s"Platform: ${runMetrics.platform.osName} ${runMetrics.platform.osVersion} | arch=${runMetrics.platform.arch} | java=${runMetrics.platform.javaVersion} | device=${runMetrics.platform.deviceName}"
     lines += s"Throughput: ${formatDecimal(runMetrics.throughputExPerSec)} ex/s"
     lines += s"Total runtime: ${formatDecimal(runMetrics.profile.totalSeconds)} s"
-    lines += s"Memory peak RSS: ${runMetrics.memoryPeak.rssBytes} bytes"
+    lines += s"Memory peak RSS: ${runMetrics.memoryPeak.rssBytes} bytes (${formatDecimal(runMetrics.memoryPeak.rssBytes.toDouble / (1024.0 * 1024.0))} MB)"
     lines += s"GC delta: count=${runMetrics.gcCountDelta} timeMs=${runMetrics.gcTimeMsDelta}"
     if runMetrics.profile.topStages.nonEmpty then
-      lines += "Top stages:"
+      val scope = preferredCell.map(c => s"${c.backend}/${c.precision}").getOrElse("n/a")
+      lines += s"Top stages (preferred run: $scope):"
       runMetrics.profile.topStages.foreach { s =>
         lines += f"  ${s.stage}%-18s ${formatDecimal(s.timeMs)} ms (${formatDecimal(s.sharePct, 1)}%%)"
       }
+    if relativeSpeedups.nonEmpty then
+      lines += "Relative speedup:"
+      relativeSpeedups.foreach(s => lines += s"  - $s")
     lines += "Benchmark matrix:"
     lines += "  backend  precision  ex/s      effective  fallback"
-    runMetrics.benchmarkMatrix.sortBy(c => (c.backend, c.precision)).foreach { c =>
-      val fb = if c.fallbackOps.isEmpty then "-" else c.fallbackOps.mkString("+")
+    matrixSorted.foreach { c =>
+      val fb = if c.fallbackOps.isEmpty then "none" else c.fallbackOps.mkString("+")
       lines += f"  ${c.backend}%-7s ${c.precision}%-9s ${formatDecimal(c.exPerSec)}%8s  ${c.effectiveBackend}%-9s $fb"
     }
     persisted.foreach { out =>

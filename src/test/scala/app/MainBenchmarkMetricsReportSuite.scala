@@ -48,7 +48,9 @@ class MainBenchmarkMetricsReportSuite extends FunSuite:
       gcCountDelta = 2,
       gcTimeMsDelta = 15,
       benchmarkMatrix = Vector(
+        BenchmarkCell("cpu", "fp32", "cpu", 200.0, 1.0, Vector.empty, "CPU backend (precision=fp32)"),
         BenchmarkCell("cpu", "fp64", "cpu", 100.0, 2.0, Vector.empty, "CPU backend (precision=fp64)"),
+        BenchmarkCell("gpu", "fp64", "gpu", 600.0, 0.3, Vector.empty, "Metal backend (...)"),
         BenchmarkCell("gpu", "fp32", "gpu", 900.0, 0.2, Vector("batchSoftmax"), "Metal backend (...)")
       ),
       notes = Map.empty
@@ -81,14 +83,22 @@ class MainBenchmarkMetricsReportSuite extends FunSuite:
     assert(out.contains("Run ID: benchmark-abc"))
     assert(out.contains("Platform: macOS 14.4 | arch=aarch64 | java=21.0.6 | device=Apple M1"))
     assert(out.contains("Total runtime: 2.50 s"))
-    assert(out.contains("Memory peak RSS: 300 bytes"))
+    assert(out.contains("Memory peak RSS: 300 bytes (0.00 MB)"))
     assert(out.contains("GC delta: count=2 timeMs=15"))
-    assert(out.contains("Top stages:"))
+    assert(out.contains("Top stages (preferred run: gpu/fp32):"))
     assert(out.contains("matMul"))
+    assert(out.contains("Relative speedup:"))
+    assert(out.contains("gpu fp32 vs cpu fp32: 4.50x"))
+    assert(out.contains("gpu fp64 vs cpu fp64: 6.00x"))
+    assert(out.contains("fp32 vs fp64 on gpu: 1.50x"))
+    assert(out.contains("fp32 vs fp64 on cpu: 2.00x"))
     assert(out.contains("Benchmark matrix:"))
     assert(out.contains("backend  precision"))
+    assert(out.contains("cpu     fp32"))
     assert(out.contains("cpu     fp64"))
     assert(out.contains("gpu     fp32"))
+    assert(out.contains("gpu     fp64"))
+    assert(out.contains("none"))
     assert(out.contains("batchSoftmax"))
     assert(out.contains("Baseline: benchmark-prev"))
     assert(out.contains("Regression verdict: ok"))
