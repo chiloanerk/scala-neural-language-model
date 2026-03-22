@@ -33,8 +33,11 @@ Observed local performance on M1 (example runs):
 ### 1) Main menu
 
 ```bash
-sbt "runMain app.Main"
+sbt "run"
 ```
+
+If sbt asks for a main class, choose `app.Main`.
+To skip that prompt, run `sbt "runMain app.Main ..."` directly.
 
 ### 2) Train (interactive)
 
@@ -57,13 +60,13 @@ sbt "run train --inputs data/corpus/a.txt,data/corpus/b.txt --inputWeights 0.7,0
 ### 4) Predict
 
 ```bash
-sbt "runMain app.Main predict --context 'the company' --topK 5"
+sbt "run predict --context 'the company' --topK 5"
 ```
 
 ### 5) Benchmark (runs full matrix by default)
 
 ```bash
-sbt "runMain app.Main benchmark --input data/corpus/example-corpus.txt --sample 2000"
+sbt "run benchmark --input data/corpus/example-corpus.txt --sample 2000"
 ```
 
 By default benchmark runs:
@@ -90,7 +93,7 @@ metal-jni/scripts/build-metal-jni.sh
 Probe availability:
 
 ```bash
-sbt "runMain app.Main gpu-info --precision fp64"
+sbt "run gpu-info --precision fp64"
 ```
 
 If GPU/JNI is unavailable, GPU selection safely falls back to CPU with diagnostics.
@@ -140,11 +143,28 @@ Notes:
 - With `--fresh --yes`, include `--contextSize` and `--maxVocab` for fully non-interactive runs
 - Training output uses a live progress display in interactive terminals (static epoch rows + trajectory status)
 - If your terminal does not render live updates, set `TRAIN_PROGRESS_FORCE_TTY=1` (or disable with `TRAIN_PROGRESS_FORCE_TTY=0`)
+- If training input is not valid UTF-8, the CLI asks after `Start training?` whether to create a UTF-8 copy (`*.utf8.txt`) and use it for that run
+- If you accept, the copy is written once and reused on later runs; phase labels show the effective input file (for example `bbc-all.utf8.txt`)
+- If you run with `--yes`, UTF-8 conversion prompt is skipped and training falls back to system-default decoding
+- Replay UX in interactive mode:
+  - fresh runs ask whether to enable replay memory for future continual training
+  - continue runs show replay options (defaults, disable, or customize ratio/buffer)
+  - `replayRatio=0.3` is the default/recommended balance
+
+Interactive flow (`sbt "run train"`):
+
+1. Continue existing model or start fresh
+2. Select training file
+3. Select preset
+4. Replay prompt (fresh vs continue flow)
+5. Context size / max vocab for fresh architecture
+6. Summary + `Start training?` confirmation
+7. Optional UTF-8 normalization prompt if decode fails
 
 ### `predict`
 
 ```bash
-sbt "runMain app.Main predict --context 'your text' --topK 5"
+sbt "run predict --context 'your text' --topK 5"
 ```
 
 Options:
@@ -154,10 +174,15 @@ Options:
 - `--backend cpu|gpu` (default `gpu`)
 - `--precision fp64|fp32` (default `fp64`)
 
+Notes:
+
+- Without `--context`, prediction stays in an interactive loop until `quit`/`exit`.
+- High `<UNK>` confidence triggers a hint to use longer in-domain context or larger vocab.
+
 ### `chunk`
 
 ```bash
-sbt "runMain app.Main chunk --input data/corpus/large.txt --lines 2000 --yes"
+sbt "run chunk --input data/corpus/large.txt --lines 2000 --yes"
 ```
 
 Options:
@@ -171,7 +196,7 @@ Options:
 ### `benchmark`
 
 ```bash
-sbt "runMain app.Main benchmark --input data/corpus/example-corpus.txt --sample 2000"
+sbt "run benchmark --input data/corpus/example-corpus.txt --sample 2000"
 ```
 
 Options:
@@ -213,8 +238,11 @@ sbt "run train --input data/corpus/bbc-business.txt --preset balanced --fresh --
 - Training always saves to:
   - `data/models/latest.ckpt`
   - `data/models/latest.vocab`
+- Replay memory (when enabled) saves to:
+  - `data/models/latest.replay`
 - Continuing training reuses existing model/vocab
 - `--fresh` starts a new model and overwrites `latest.*` after training
+- Interactive interrupt flow allows save choice (best/current/discard) before exit
 
 ## Data/Repo Policy
 
