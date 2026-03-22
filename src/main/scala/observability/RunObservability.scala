@@ -5,6 +5,8 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path, StandardOpenOption}
 import java.security.MessageDigest
 import java.time.Instant
+import java.util.Locale
+import scala.util.matching.Regex
 
 final case class MemoryMetrics(
     timestampEpochMs: Long,
@@ -12,6 +14,27 @@ final case class MemoryMetrics(
     heapCommittedBytes: Long,
     nonHeapUsedBytes: Long,
     rssBytes: Long
+)
+
+final case class GcMetrics(
+    collectionCount: Long,
+    collectionTimeMs: Long
+)
+
+final case class TopStage(
+    stage: String,
+    timeMs: Double,
+    sharePct: Double
+)
+
+final case class BenchmarkCell(
+    backend: String,
+    precision: String,
+    effectiveBackend: String,
+    exPerSec: Double,
+    estSec: Double,
+    fallbackOps: Vector[String],
+    diagnostics: String
 )
 
 final case class GpuHotPathMetrics(
@@ -23,13 +46,22 @@ final case class GpuHotPathMetrics(
     fallbackDetected: Boolean
 )
 
+final case class PlatformInfo(
+    osName: String,
+    osVersion: String,
+    arch: String,
+    javaVersion: String,
+    deviceName: String
+)
+
 final case class RunProfile(
     totalSeconds: Double,
     epochSecondsTotal: Double,
     epochSecondsAvg: Double,
     batchMillisAvg: Double,
     batchMillisP95: Double,
-    backendProfileSummary: String
+    backendProfileSummary: String,
+    topStages: Vector[TopStage] = Vector.empty
 )
 
 final case class RegressionCheckResult(
@@ -60,10 +92,28 @@ final case class RunMetrics(
     retentionByDomainPct: Vector[(String, Double)],
     profile: RunProfile,
     gpu: GpuHotPathMetrics,
+    platform: PlatformInfo,
+    fallbackOps: Vector[String],
     memoryStart: MemoryMetrics,
     memoryEnd: MemoryMetrics,
     memoryPeak: MemoryMetrics,
+    gcCountDelta: Long,
+    gcTimeMsDelta: Long,
+    benchmarkMatrix: Vector[BenchmarkCell] = Vector.empty,
     notes: Map[String, String]
+)
+
+final case class RunSnapshot(
+    runId: String,
+    timestampEpochMs: Long,
+    mode: String,
+    runLabel: Option[String],
+    throughputExPerSec: Double,
+    fallbackOps: Vector[String],
+    topStages: Vector[TopStage],
+    benchmarkMatrix: Vector[BenchmarkCell],
+    gcCountDelta: Long,
+    gcTimeMsDelta: Long
 )
 
 object MemoryProbe:
@@ -89,6 +139,13 @@ object MemoryProbe:
       out.toLongOption.map(_ * 1024L).getOrElse(-1L)
     catch
       case _: Exception => -1L
+
+object GcProbe:
+  def snapshot(): GcMetrics =
+    val beans = ManagementFactory.getGarbageCollectorMXBeans
+    val count = beans.toArray.map(_.asInstanceOf[java.lang.management.GarbageCollectorMXBean].getCollectionCount).filter(_ >= 0).sum
+    val time = beans.toArray.map(_.asInstanceOf[java.lang.management.GarbageCollectorMXBean].getCollectionTime).filter(_ >= 0).sum
+    GcMetrics(count, time)
 
 object RunObservability:
   val DefaultMetricsDir: Path = Path.of("data/metrics")
@@ -122,6 +179,9 @@ object RunObservability:
       latestDiffSummaryPath: Option[Path]
   )
 
+  private val StageRegex: Regex = raw"([A-Za-z][A-Za-z0-9]*): calls=\d+ timeMs=([0-9]+(?:[.,][0-9]+)?)".r
+  private val DisabledRegex: Regex = raw"disabled=([^)]*)".r
+
   def buildRunId(mode: String): String =
     val now = Instant.now().toString.replace(":", "-")
     val suffix = java.util.UUID.randomUUID().toString.take(8)
@@ -131,6 +191,27 @@ object RunObservability:
     val payload = entries.sortBy(_._1).map { case (k, v) => s"$k=$v" }.mkString("|")
     val digest = MessageDigest.getInstance("SHA-256").digest(payload.getBytes(StandardCharsets.UTF_8))
     digest.take(8).map("%02x".format(_)).mkString
+
+  def topStagesFromProfile(profileSummary: String, limit: Int = 3): Vector[TopStage] =
+    val rows = StageRegex.findAllMatchIn(profileSummary).toVector.flatMap { m =>
+      val stage = m.group(1)
+      parseDoubleFlexible(m.group(2)).map(v => stage -> v)
+    }
+    val total = rows.map(_._2).sum
+    rows.sortBy(-_._2).take(math.max(0, limit)).map { case (stage, timeMs) =>
+      val pct = if total <= 0 then 0.0 else (timeMs / total) * 100.0
+      TopStage(stage, timeMs, pct)
+    }
+
+  def fallbackOpsFromDiagnostics(requestedBackend: String, effectiveBackend: String, diagnostics: String): Vector[String] =
+    if requestedBackend == "gpu" && effectiveBackend != "gpu" then Vector("all")
+    else
+      DisabledRegex.findFirstMatchIn(diagnostics).toVector
+        .flatMap(_.group(1).split(";").toVector.map(_.trim).filter(_.nonEmpty))
+        .map(_.takeWhile(_ != ':'))
+        .filter(_.nonEmpty)
+        .distinct
+        .sorted
 
   def persistAndReport(run: RunMetrics, settings: Settings, log: String => Unit = s => println(s)): Option[PersistOutcome] =
     if !settings.recordMetrics then None
@@ -179,6 +260,17 @@ object RunObservability:
     else
       Files.readAllLines(path, StandardCharsets.UTF_8).toArray(new Array[String](0)).toVector.flatMap(parseIndexLine)
 
+  def loadRecentSnapshots(metricsDir: Path, modeFilter: Option[String], limit: Int = 20): Vector[RunSnapshot] =
+    val path = metricsDir.resolve(HistoryFile)
+    if !Files.isRegularFile(path) then Vector.empty
+    else
+      val lines = Files.readAllLines(path, StandardCharsets.UTF_8).toArray(new Array[String](0)).toVector
+      val parsed = lines.flatMap(parseRunSnapshotLine)
+      val filtered = modeFilter match
+        case Some(m) => parsed.filter(_.mode == m)
+        case None    => parsed
+      filtered.sortBy(_.timestampEpochMs).takeRight(math.max(1, limit))
+
   def latestByMode(index: Vector[StoredRunIndex], mode: String): Option[StoredRunIndex] =
     index.filter(_.mode == mode).sortBy(_.timestampEpochMs).lastOption
 
@@ -198,9 +290,9 @@ object RunObservability:
       val status = if deltaPct <= -math.abs(warnPct) then "warn" else "ok"
       val message =
         if status == "warn" then
-          f"Throughput regressed ${-deltaPct}%.2f%% vs baseline ${baseline.runId} (threshold=${math.abs(warnPct)}%.2f%%)."
+          s"Throughput regressed ${fmtPct(-deltaPct)} vs baseline ${baseline.runId} (threshold=${fmtPct(math.abs(warnPct))})."
         else
-          f"Throughput delta vs baseline ${baseline.runId}: ${deltaPct}%.2f%% (threshold=${math.abs(warnPct)}%.2f%%)."
+          s"Throughput delta vs baseline ${baseline.runId}: ${fmtSignedPct(deltaPct)} (threshold=${fmtPct(math.abs(warnPct))})."
       Some(
         RegressionCheckResult(
           metric = "throughput_ex_per_sec",
@@ -220,12 +312,23 @@ object RunObservability:
   ): String =
     val domains =
       if run.domainValLosses.isEmpty then "-"
-      else run.domainValLosses.map { case (d, v) => f"$d=$v%.4f" }.mkString(", ")
+      else run.domainValLosses.map { case (d, v) => s"$d=${fmt(v, 4)}" }.mkString(", ")
     val retention =
       if run.retentionByDomainPct.isEmpty then "-"
-      else run.retentionByDomainPct.map { case (d, v) => f"$d=$v%.1f%%" }.mkString(", ")
+      else run.retentionByDomainPct.map { case (d, v) => s"$d=${fmt(v, 1)}%" }.mkString(", ")
+    val topStages =
+      if run.profile.topStages.isEmpty then "-"
+      else run.profile.topStages.map(s => s"${s.stage}:${fmt(s.timeMs, 2)}ms(${fmt(s.sharePct, 1)}%)").mkString(", ")
+    val fallback = if run.fallbackOps.isEmpty then "-" else run.fallbackOps.mkString(",")
+    val matrix =
+      if run.benchmarkMatrix.isEmpty then "-"
+      else
+        run.benchmarkMatrix
+          .sortBy(c => (c.backend, c.precision))
+          .map(c => s"${c.backend}/${c.precision}=${fmt(c.exPerSec, 2)}ex/s(eff=${c.effectiveBackend},fb=${if c.fallbackOps.isEmpty then "-" else c.fallbackOps.mkString("+")})")
+          .mkString("; ")
 
-    val baselineLine = baseline.map(b => s"baseline: ${b.runId} (${b.mode}, ${f"${b.throughputExPerSec}%.2f"} ex/s)").getOrElse("baseline: none")
+    val baselineLine = baseline.map(b => s"baseline: ${b.runId} (${b.mode}, ${fmt(b.throughputExPerSec, 2)} ex/s)").getOrElse("baseline: none")
     val regressionLine = regression.map(r => s"regression: ${r.status} (${r.message})").getOrElse("regression: n/a")
 
     s"""Run summary
@@ -235,14 +338,19 @@ object RunObservability:
 |label: ${run.runLabel.getOrElse("-")}
 |dataset: ${run.dataset}
 |config_fingerprint: ${run.configFingerprint}
+|platform: os=${run.platform.osName} ${run.platform.osVersion} arch=${run.platform.arch} java=${run.platform.javaVersion} device=${run.platform.deviceName}
 |backend: requested=${run.requestedBackend} effective=${run.gpu.effectiveBackend} precision=${run.precision}
-|throughput_ex_per_sec: ${f"${run.throughputExPerSec}%.2f"}
-|losses: train=${run.trainLoss.map(v => f"$v%.4f").getOrElse("-")} val=${run.valLoss.map(v => f"$v%.4f").getOrElse("-")} ppl=${run.valPerplexity.map(v => f"$v%.2f").getOrElse("-")}
+|throughput_ex_per_sec: ${fmt(run.throughputExPerSec, 2)}
+|losses: train=${run.trainLoss.map(v => fmt(v, 4)).getOrElse("-")} val=${run.valLoss.map(v => fmt(v, 4)).getOrElse("-")} ppl=${run.valPerplexity.map(v => fmt(v, 2)).getOrElse("-")}
 |domains: $domains
 |retention: $retention
-|profile: total_s=${f"${run.profile.totalSeconds}%.2f"} epoch_total_s=${f"${run.profile.epochSecondsTotal}%.2f"} epoch_avg_s=${f"${run.profile.epochSecondsAvg}%.2f"} batch_avg_ms=${f"${run.profile.batchMillisAvg}%.3f"} batch_p95_ms=${f"${run.profile.batchMillisP95}%.3f"}
+|top_stages: $topStages
+|fallback_ops: $fallback
+|benchmark_matrix: $matrix
+|profile: total_s=${fmt(run.profile.totalSeconds, 2)} epoch_total_s=${fmt(run.profile.epochSecondsTotal, 2)} epoch_avg_s=${fmt(run.profile.epochSecondsAvg, 2)} batch_avg_ms=${fmt(run.profile.batchMillisAvg, 3)} batch_p95_ms=${fmt(run.profile.batchMillisP95, 3)}
 |gpu: fallback=${run.gpu.fallbackDetected} enabled_ops=${if run.gpu.enabledOps.isEmpty then "-" else run.gpu.enabledOps.mkString(",")}
 |memory_bytes: start_heap=${run.memoryStart.heapUsedBytes} end_heap=${run.memoryEnd.heapUsedBytes} peak_heap=${run.memoryPeak.heapUsedBytes} start_rss=${run.memoryStart.rssBytes} end_rss=${run.memoryEnd.rssBytes} peak_rss=${run.memoryPeak.rssBytes}
+|gc: count_delta=${run.gcCountDelta} time_ms_delta=${run.gcTimeMsDelta}
 |$baselineLine
 |$regressionLine
 |""".stripMargin
@@ -253,9 +361,9 @@ object RunObservability:
       else ((current.throughputExPerSec - baseline.throughputExPerSec) / baseline.throughputExPerSec) * 100.0
     val verdict = regression.map(_.status).getOrElse("n/a")
     s"""Run comparison
-|current: ${current.runId} (${f"${current.throughputExPerSec}%.2f"} ex/s)
-|baseline: ${baseline.runId} (${f"${baseline.throughputExPerSec}%.2f"} ex/s)
-|delta_pct: ${f"$deltaPct%.2f"}
+|current: ${current.runId} (${fmt(current.throughputExPerSec, 2)} ex/s)
+|baseline: ${baseline.runId} (${fmt(baseline.throughputExPerSec, 2)} ex/s)
+|delta_pct: ${fmt(deltaPct, 2)}
 |status: $verdict
 |""".stripMargin
 
@@ -263,6 +371,14 @@ object RunObservability:
     val domainJson = run.domainValLosses.map { case (d, v) => s"""{"domain":${j(d)},"valLoss":${jd(v)}}""" }.mkString("[", ",", "]")
     val retentionJson = run.retentionByDomainPct.map { case (d, v) => s"""{"domain":${j(d)},"retentionPct":${jd(v)}}""" }.mkString("[", ",", "]")
     val notesJson = run.notes.toVector.sortBy(_._1).map { case (k, v) => s"${j(k)}:${j(v)}" }.mkString("{", ",", "}")
+    val fallbackJson = run.fallbackOps.map(j).mkString("[", ",", "]")
+    val topStagesJson = run.profile.topStages.map(s => s"""{"stage":${j(s.stage)},"timeMs":${jd(s.timeMs)},"sharePct":${jd(s.sharePct)}}""").mkString("[", ",", "]")
+    val benchJson = run.benchmarkMatrix
+      .map { c =>
+        s"""{"backend":${j(c.backend)},"precision":${j(c.precision)},"effectiveBackend":${j(c.effectiveBackend)},"exPerSec":${jd(c.exPerSec)},"estSec":${jd(c.estSec)},"fallbackOps":${c.fallbackOps.map(j).mkString("[", ",", "]")},"diagnostics":${j(c.diagnostics)}}"""
+      }
+      .mkString("[", ",", "]")
+
     s"{" +
       s""""runId":${j(run.runId)},""" +
       s""""timestampEpochMs":${run.timestampEpochMs},""" +
@@ -279,22 +395,28 @@ object RunObservability:
       s""""epochs":${run.epochs},""" +
       s""""domainValLosses":$domainJson,""" +
       s""""retentionByDomainPct":$retentionJson,""" +
-      s""""profile":${profileJson(run.profile)},""" +
+      s""""profile":${profileJson(run.profile, topStagesJson)},""" +
       s""""gpu":${gpuJson(run.gpu)},""" +
+      s""""platform":${platformJson(run.platform)},""" +
+      s""""fallbackOps":$fallbackJson,""" +
       s""""memoryStart":${memoryJson(run.memoryStart)},""" +
       s""""memoryEnd":${memoryJson(run.memoryEnd)},""" +
       s""""memoryPeak":${memoryJson(run.memoryPeak)},""" +
+      s""""gcCountDelta":${run.gcCountDelta},""" +
+      s""""gcTimeMsDelta":${run.gcTimeMsDelta},""" +
+      s""""benchmarkMatrix":$benchJson,""" +
       s""""notes":$notesJson""" +
       s"}"
 
-  private def profileJson(p: RunProfile): String =
+  private def profileJson(p: RunProfile, topStagesJson: String): String =
     s"{" +
       s""""totalSeconds":${jd(p.totalSeconds)},""" +
       s""""epochSecondsTotal":${jd(p.epochSecondsTotal)},""" +
       s""""epochSecondsAvg":${jd(p.epochSecondsAvg)},""" +
       s""""batchMillisAvg":${jd(p.batchMillisAvg)},""" +
       s""""batchMillisP95":${jd(p.batchMillisP95)},""" +
-      s""""backendProfileSummary":${j(p.backendProfileSummary)}""" +
+      s""""backendProfileSummary":${j(p.backendProfileSummary)},""" +
+      s""""topStages":$topStagesJson""" +
       s"}"
 
   private def gpuJson(g: GpuHotPathMetrics): String =
@@ -306,6 +428,15 @@ object RunObservability:
       s""""enabledOps":$ops,""" +
       s""""profileSummary":${j(g.profileSummary)},""" +
       s""""fallbackDetected":${if g.fallbackDetected then "true" else "false"}""" +
+      s"}"
+
+  private def platformJson(p: PlatformInfo): String =
+    s"{" +
+      s""""osName":${j(p.osName)},""" +
+      s""""osVersion":${j(p.osVersion)},""" +
+      s""""arch":${j(p.arch)},""" +
+      s""""javaVersion":${j(p.javaVersion)},""" +
+      s""""deviceName":${j(p.deviceName)}""" +
       s"}"
 
   private def memoryJson(m: MemoryMetrics): String =
@@ -345,6 +476,63 @@ object RunObservability:
         )
       )
 
+  private def parseRunSnapshotLine(line: String): Option[RunSnapshot] =
+    for
+      runId <- extractString(line, "runId")
+      mode <- extractString(line, "mode")
+      ts <- extractLong(line, "timestampEpochMs")
+      throughput <- extractDouble(line, "throughputExPerSec")
+    yield
+      val label = extractNullableString(line, "runLabel")
+      val fallbackOps = extractStringArray(line, "fallbackOps")
+      val topStages = extractTopStages(line)
+      val matrix = extractBenchmarkMatrix(line)
+      val gcCount = extractLong(line, "gcCountDelta").getOrElse(0L)
+      val gcTime = extractLong(line, "gcTimeMsDelta").getOrElse(0L)
+      RunSnapshot(runId, ts, mode, label, throughput, fallbackOps, topStages, matrix, gcCount, gcTime)
+
+  private def extractString(line: String, key: String): Option[String] =
+    raw""""\Q$key\E":"([^"]*)"""".r.findFirstMatchIn(line).map(_.group(1))
+
+  private def extractNullableString(line: String, key: String): Option[String] =
+    raw""""\Q$key\E":null""".r.findFirstMatchIn(line) match
+      case Some(_) => None
+      case None    => extractString(line, key)
+
+  private def extractDouble(line: String, key: String): Option[Double] =
+    raw""""\Q$key\E":(-?[0-9]+(?:[.,][0-9]+)?)""".r.findFirstMatchIn(line).flatMap(m => parseDoubleFlexible(m.group(1)))
+
+  private def extractLong(line: String, key: String): Option[Long] =
+    raw""""\Q$key\E":(-?[0-9]+)""".r.findFirstMatchIn(line).flatMap(m => m.group(1).toLongOption)
+
+  private def extractStringArray(line: String, key: String): Vector[String] =
+    val body = raw""""\Q$key\E":\[(.*?)\]""".r.findFirstMatchIn(line).map(_.group(1)).getOrElse("")
+    raw""""([^"]+)"""".r.findAllMatchIn(body).map(_.group(1)).toVector
+
+  private def extractTopStages(line: String): Vector[TopStage] =
+    raw"""\{"stage":"([^"]+)","timeMs":(-?[0-9]+(?:\.[0-9]+)?),"sharePct":(-?[0-9]+(?:\.[0-9]+)?)\}""".r
+      .findAllMatchIn(line)
+      .flatMap { m =>
+        for
+          t <- parseDoubleFlexible(m.group(2))
+          s <- parseDoubleFlexible(m.group(3))
+        yield TopStage(m.group(1), t, s)
+      }
+      .toVector
+
+  private def extractBenchmarkMatrix(line: String): Vector[BenchmarkCell] =
+    raw"""\{"backend":"([^"]+)","precision":"([^"]+)","effectiveBackend":"([^"]+)","exPerSec":(-?[0-9]+(?:\.[0-9]+)?),"estSec":(-?[0-9]+(?:\.[0-9]+)?),"fallbackOps":\[(.*?)\],"diagnostics":"([^"]*)"\}""".r
+      .findAllMatchIn(line)
+      .flatMap { m =>
+        for
+          ex <- parseDoubleFlexible(m.group(4))
+          est <- parseDoubleFlexible(m.group(5))
+        yield
+          val fallbackOps = raw""""([^"]+)"""".r.findAllMatchIn(m.group(6)).map(_.group(1)).toVector
+          BenchmarkCell(m.group(1), m.group(2), m.group(3), ex, est, fallbackOps, m.group(7))
+      }
+      .toVector
+
   private def j(raw: String): String =
     val escaped = raw
       .replace("\\", "\\\\")
@@ -357,4 +545,15 @@ object RunObservability:
   private def jo(raw: Option[String]): String = raw.map(j).getOrElse("null")
   private def jod(raw: Option[Double]): String = raw.map(jd).getOrElse("null")
   private def jd(v: Double): String =
-    if v.isNaN || v.isInfinity then "null" else f"$v%.12f"
+    if v.isNaN || v.isInfinity then "null" else String.format(Locale.US, "%.12f", Double.box(v))
+
+  private def fmt(v: Double, decimals: Int): String =
+    String.format(Locale.US, s"%.${math.max(0, decimals)}f", Double.box(v))
+
+  private def fmtPct(v: Double): String = s"${fmt(v, 2)}%"
+  private def fmtSignedPct(v: Double): String =
+    val prefix = if v > 0 then "+" else ""
+    s"$prefix${fmt(v, 2)}%"
+
+  private def parseDoubleFlexible(raw: String): Option[Double] =
+    raw.replace(',', '.').toDoubleOption

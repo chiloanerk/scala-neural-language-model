@@ -37,6 +37,40 @@ class MainConfigSuite extends FunSuite:
     assertEquals(combos, Vector(("gpu", "fp32")))
   }
 
+  test("preferredBenchmarkKey prioritizes gpu fp32 when present") {
+    val key = Main.preferredBenchmarkKey(
+      Vector(
+        ("cpu", "fp64") -> 500.0,
+        ("gpu", "fp64") -> 3000.0,
+        ("gpu", "fp32") -> 4500.0,
+        ("cpu", "fp32") -> 900.0
+      )
+    )
+    assertEquals(key, Some(("gpu", "fp32")))
+  }
+
+  test("preferredBenchmarkKey falls back to highest throughput for unknown modes") {
+    val key = Main.preferredBenchmarkKey(
+      Vector(
+        ("cpu", "fp16") -> 1200.0,
+        ("gpu", "fp16") -> 3200.0
+      )
+    )
+    assertEquals(key, Some(("gpu", "fp16")))
+  }
+
+  test("benchmarkSelection maps menu choices to backend/precision filters") {
+    assertEquals(Main.benchmarkSelection(0), (None, None))
+    assertEquals(Main.benchmarkSelection(1), (Some("cpu"), Some("fp64")))
+    assertEquals(Main.benchmarkSelection(2), (Some("cpu"), Some("fp32")))
+    assertEquals(Main.benchmarkSelection(3), (Some("gpu"), Some("fp64")))
+    assertEquals(Main.benchmarkSelection(4), (Some("gpu"), Some("fp32")))
+    assertEquals(Main.benchmarkSelection(5), (Some("cpu"), None))
+    assertEquals(Main.benchmarkSelection(6), (Some("gpu"), None))
+    assertEquals(Main.benchmarkSelection(7), (None, Some("fp64")))
+    assertEquals(Main.benchmarkSelection(8), (None, Some("fp32")))
+  }
+
   test("utf8CopyPath inserts .utf8 before extension") {
     val got = Main.utf8CopyPath(java.nio.file.Path.of("data/corpus/bbc-all.txt"))
     assertEquals(got.toString, "data/corpus/bbc-all.utf8.txt")

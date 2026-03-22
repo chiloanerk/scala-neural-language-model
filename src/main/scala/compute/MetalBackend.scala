@@ -1,6 +1,7 @@
 package compute
 
 import linalg.{Matrix, Vec}
+import java.util.Locale
 
 /**
   * Phase-1 backend: routes hot-path ops through CPU fallback unless native Metal kernels are available.
@@ -242,13 +243,13 @@ final case class MetalBackend(precision: String, probe: MetalProbe, cpuFallback:
 
   override def profileSummary: String =
     def ms(nanos: Long): Double = nanos.toDouble / 1e6
-    s"matVec: calls=$matVecCalls timeMs=${"%.2f".format(ms(matVecNanos))}, " +
-      s"outer: calls=$outerCalls timeMs=${"%.2f".format(ms(outerNanos))}, " +
-      s"linearActivation: calls=$linearCalls timeMs=${"%.2f".format(ms(linearNanos))}, " +
-      s"matMul: calls=$matMulCalls timeMs=${"%.2f".format(ms(matMulNanos))}, " +
-      s"linearBatch: calls=$linearBatchCalls timeMs=${"%.2f".format(ms(linearBatchNanos))}, " +
-      s"softmaxBatch: calls=$softmaxBatchCalls timeMs=${"%.2f".format(ms(softmaxBatchNanos))}, " +
-      s"ceBatch: calls=$ceBatchCalls timeMs=${"%.2f".format(ms(ceBatchNanos))}"
+    s"matVec: calls=$matVecCalls timeMs=${String.format(Locale.US, "%.2f", Double.box(ms(matVecNanos)))}, " +
+      s"outer: calls=$outerCalls timeMs=${String.format(Locale.US, "%.2f", Double.box(ms(outerNanos)))}, " +
+      s"linearActivation: calls=$linearCalls timeMs=${String.format(Locale.US, "%.2f", Double.box(ms(linearNanos)))}, " +
+      s"matMul: calls=$matMulCalls timeMs=${String.format(Locale.US, "%.2f", Double.box(ms(matMulNanos)))}, " +
+      s"linearBatch: calls=$linearBatchCalls timeMs=${String.format(Locale.US, "%.2f", Double.box(ms(linearBatchNanos)))}, " +
+      s"softmaxBatch: calls=$softmaxBatchCalls timeMs=${String.format(Locale.US, "%.2f", Double.box(ms(softmaxBatchNanos)))}, " +
+      s"ceBatch: calls=$ceBatchCalls timeMs=${String.format(Locale.US, "%.2f", Double.box(ms(ceBatchNanos)))}"
 
 object MetalBackend:
   def create(precision: String): MetalBackend =

@@ -29,6 +29,8 @@ Latest recorded performance (March 22, 2026, from `data/metrics`):
 - Train delta vs baseline: `+2.77%`
 - Benchmark (CPU fp64, label `smoke`): `1264.17 ex/s` (`benchmark-2026-03-22T03-08-39.129693Z-463af53a`)
 
+This section is a **periodic milestone snapshot** (not updated after every run).
+
 ## Requirements
 
 - Java 21+
@@ -44,7 +46,7 @@ sbt "run"
 ```
 
 If sbt asks for a main class, choose `app.Main`.
-To skip that prompt, run `sbt "runMain app.Main ..."` directly.
+To skip that prompt, run `sbt "run ..."` directly.
 
 ### 2) Train (interactive)
 
@@ -135,11 +137,6 @@ Key options:
 - `--replayBufferPath FILE` (optional; default `data/models/latest.replay` when replay is enabled)
 - `--ewcLambda VALUE` (default: `0.0`, off)
 - `--ewcSamples N` (optional EWC sampling count)
-- `--recordMetrics true|false` (default: `true`)
-- `--metricsDir DIR` (default: `data/metrics`)
-- `--runLabel TEXT` (optional label for grouping/comparison)
-- `--compareTo latest|RUN_ID|LABEL` (optional baseline selector)
-- `--regressionWarnPct VALUE` (default: `5.0`, warn-only)
 - `--yes` (auto-confirm final prompt)
 
 Preset learning rates:
@@ -211,6 +208,8 @@ Options:
 sbt "run benchmark --input data/corpus/example-corpus.txt --sample 2000"
 ```
 
+`sbt "run benchmark"` (with no flags) launches an interactive setup that lets you pick backend/precision combinations and optional metrics reporting options before running.
+
 Options:
 
 - `--input FILE`
@@ -220,24 +219,11 @@ Options:
 - `--batchSize N`
 - `--backend cpu|gpu` (optional filter; default runs both)
 - `--precision fp64|fp32` (optional filter; default runs both)
-- `--recordMetrics true|false` (default: `true`)
-- `--metricsDir DIR` (default: `data/metrics`)
+- `--metrics` (runs complete metrics flow: persist + report output)
+- `--metricsDir DIR` (default: `data/metrics`, used with `--metrics`)
 - `--runLabel TEXT` (optional label for grouping/comparison)
-- `--compareTo latest|RUN_ID|LABEL` (optional baseline selector)
+- `--compareTo latest|RUN_ID|LABEL` (optional baseline selector; default with `--metrics`: `latest`)
 - `--regressionWarnPct VALUE` (default: `5.0`, warn-only)
-
-### `metrics-report`
-
-```bash
-sbt "run metrics-report --metricsDir data/metrics --mode train --compareTo latest"
-```
-
-Options:
-
-- `--metricsDir DIR` (default: `data/metrics`)
-- `--mode train|benchmark` (optional filter)
-- `--compareTo latest|RUN_ID|LABEL` (optional baseline selector)
-- `--regressionWarnPct VALUE` (default: `5.0`)
 
 ## Metrics Workflow
 
@@ -248,7 +234,36 @@ Options:
   - `data/metrics/latest-diff-summary.txt` (when a baseline is available)
 - Throughput regression policy is warn-only by default: warning at `>5%` slowdown.
 - GPU usage truth includes requested backend, effective backend, enabled GPU ops, diagnostics, and backend profile summary.
+- Platform metadata is recorded per run (`os`, `os version`, `arch`, `java version`, and detected device name when available).
 - Memory captures JVM heap/non-heap plus process RSS at run start/end, with epoch snapshots contributing to peak values during training.
+- GC observability includes run-level collection count/time deltas.
+
+### Performance Summary (Example Output)
+
+```text
+Run summary
+- platform/device: macOS 14.x | arch=aarch64 | java=21 | device=Apple M1
+- backend requested/effective: gpu/gpu
+- precision: fp32
+- examples/sec: 997.72
+- total runtime: 41.50s
+- top time shares: matMul 58.0%, softmaxBatch 26.5%, ceBatch 3.5%
+- fallback ops: none
+- memory peak RSS: 2160377856 bytes
+- validation: val_loss=6.3442, val_ppl=569.16
+- regression vs baseline: +2.77% (status=ok)
+```
+
+### Benchmark Update Policy
+
+- Day-to-day metrics stay local in `data/metrics` and are inspected through `benchmark --metrics`.
+- README performance numbers are updated only at significant milestones/breakthroughs.
+- Typical update triggers:
+  - model/training architecture changes
+  - backend or hardware-path changes
+  - observability/regression framework upgrades
+  - material deltas on key metrics (guideline: `>=5-10%`)
+- When README numbers are refreshed, include date and run ID(s).
 
 ## Training Data Guide
 
