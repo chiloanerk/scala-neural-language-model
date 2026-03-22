@@ -21,5 +21,8 @@ jobs:
           java-version: "17"
           cache: sbt
 
+      - name: Set up sbt
+        uses: sbt/setup-sbt@v1
+
       - name: Run tests
         run: sbt -batch test
