@@ -4,6 +4,7 @@ import compute.{BackendSelector, ComputeBackend}
 import data.Example
 import eval.Metrics
 import nn.{LanguageModel, Params}
+import observability.MemoryProbe
 
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 import scala.util.Random
@@ -64,6 +65,8 @@ final case class EpochMetrics(
     learningRate: Double,
     epochSeconds: Double = 0.0,
     examplesPerSec: Double = 0.0,
+    avgBatchMillis: Double = 0.0,
+    p95BatchMillis: Double = 0.0,
     status: TrainingStatus = TrainingStatus.Stalled,
     statusReason: String = "n/a",
     bestDeltaPct: Double = 0.0,
@@ -71,7 +74,9 @@ final case class EpochMetrics(
     mixedValLoss: Double = Double.NaN,
     perDomainValMetrics: Vector[DomainValMetrics] = Vector.empty,
     retentionMetrics: Vector[RetentionMetrics] = Vector.empty,
-    phaseLabel: Option[String] = None
+    phaseLabel: Option[String] = None,
+    heapUsedBytes: Long = -1L,
+    rssBytes: Long = -1L
 )
 
 final case class TrainResult(
@@ -79,7 +84,12 @@ final case class TrainResult(
     history: Vector[EpochMetrics],
     interrupted: Boolean = false,
     saveDecision: SaveDecision = SaveDecision.SaveCurrent,
-    replayBuffer: Option[ReplayBuffer] = None
+    replayBuffer: Option[ReplayBuffer] = None,
+    requestedBackend: String = "cpu",
+    effectiveBackend: String = "cpu",
+    backendDiagnostics: String = "",
+    gpuOpsEnabled: Vector[String] = Vector.empty,
+    backendProfileSummary: String = ""
 )
 
 object Trainer:
@@ -163,6 +173,20 @@ object Trainer:
           case _                         => println("Please choose b, c, or d.")
       decision.get
 
+  private def shouldPromptOnInterrupt(interactive: Boolean): Boolean =
+    if !interactive then false
+    else
+      val forcePrompt = Option(System.getenv("TRAIN_INTERRUPT_PROMPT")).exists(v => v == "1" || v.equalsIgnoreCase("true"))
+      if forcePrompt then true
+      else
+        // In sbt-managed runs, Ctrl+C is often consumed by sbt first, which can
+        // cancel the task before an in-app prompt can complete.
+        val sbtManaged =
+          Option(System.getProperty("sbt.version")).isDefined ||
+          Option(System.getProperty("sbt.log.noformat")).isDefined ||
+          Option(System.getenv("SBT_OPTS")).isDefined
+        !sbtManaged
+
   private def installInterruptHandler(
       cancelRequested: AtomicBoolean,
       currentEpoch: AtomicInteger,
@@ -196,16 +220,29 @@ object Trainer:
       }
     }
 
-  def train(initial: Params, trainSet: Vector[Example], valSet: Vector[Example], cfg: TrainConfig): TrainResult =
+  def train(
+      initial: Params,
+      trainSet: Vector[Example],
+      valSet: Vector[Example],
+      cfg: TrainConfig,
+      onSafePoint: Params => Unit = _ => ()
+  ): TrainResult =
     val phase = TrainingPhase("domain-1", trainSet, valSet, weight = 1.0)
-    trainPhased(initial, Vector(phase), cfg.copy(replayRatio = 0.0, replayBufferSize = 0), replayBuffer = None)
+    trainPhased(
+      initial,
+      Vector(phase),
+      cfg.copy(replayRatio = 0.0, replayBufferSize = 0),
+      replayBuffer = None,
+      onSafePoint = onSafePoint
+    )
       .copy(replayBuffer = None)
 
   def trainPhased(
       initial: Params,
       phases: Vector[TrainingPhase],
       cfg: TrainConfig,
-      replayBuffer: Option[ReplayBuffer] = None
+      replayBuffer: Option[ReplayBuffer] = None,
+      onSafePoint: Params => Unit = _ => ()
   ): TrainResult =
     require(phases.nonEmpty, "phases cannot be empty")
     require(phases.forall(_.trainSet.nonEmpty), "all phase train sets must be non-empty")
@@ -219,6 +256,7 @@ object Trainer:
 
     val display = TrainingDisplay.create()
     val interactive = TrainingDisplay.isInteractiveTerminal
+    val promptOnInterrupt = shouldPromptOnInterrupt(interactive)
 
     val backend = BackendSelector.fromConfig(cfg.backend, cfg.precision, warn = msg => println(s"  [backend] $msg"))
     println(s"Using backend: ${backend.diagnostics}")
@@ -301,9 +339,11 @@ object Trainer:
           var seen = 0
           var nextReportAt = progressInterval
           var batchIndex = 0
+          val batchDurationsMs = scala.collection.mutable.ArrayBuffer.empty[Double]
 
           while batchIndex < batches.length && !stopTraining do
             val batch = batches(batchIndex)
+            val batchStart = System.nanoTime()
             val (updated, loss) = LanguageModel.trainBatchStep(
               params,
               batch,
@@ -314,6 +354,8 @@ object Trainer:
               backend = backend
             )
             params = updated
+            val batchMs = (System.nanoTime() - batchStart).toDouble / 1e6
+            batchDurationsMs += batchMs
             lossSum += loss * batch.size
             seen += batch.size
 
@@ -336,6 +378,8 @@ object Trainer:
                   avgLoss = avgLoss
                 )
               )
+              try onSafePoint(params)
+              catch case NonFatal(_) => ()
 
               while nextReportAt <= seen do
                 nextReportAt += progressInterval
@@ -349,6 +393,14 @@ object Trainer:
           val trainLoss = if seen == 0 then 0.0 else lossSum / seen.toDouble
           val epochTime = (System.currentTimeMillis() - startTime) / 1000.0
           val examplesPerSec = if epochTime > 0 then seen.toDouble / epochTime else 0.0
+          val avgBatchMs = if batchDurationsMs.isEmpty then 0.0 else batchDurationsMs.sum / batchDurationsMs.length.toDouble
+          val p95BatchMs =
+            if batchDurationsMs.isEmpty then 0.0
+            else
+              val sorted = batchDurationsMs.sorted
+              val idx = math.min(sorted.length - 1, math.floor(sorted.length * 0.95).toInt)
+              sorted(idx)
+          val memSnapshot = MemoryProbe.snapshot()
 
           val domainMetrics = seenPhases.map { p =>
             val loss = Metrics.meanLoss(params, p.valSet, cfg.activation, backend, batchSize = defaultBatchSize)
@@ -390,6 +442,8 @@ object Trainer:
             learningRate = lr,
             epochSeconds = epochTime,
             examplesPerSec = examplesPerSec,
+            avgBatchMillis = avgBatchMs,
+            p95BatchMillis = p95BatchMs,
             status = trajectory.status,
             statusReason = trajectory.reason,
             bestDeltaPct = trajectory.bestDeltaPct,
@@ -397,7 +451,9 @@ object Trainer:
             mixedValLoss = mixedValLoss,
             perDomainValMetrics = domainMetrics,
             retentionMetrics = retention,
-            phaseLabel = Some(phase.label)
+            phaseLabel = Some(phase.label),
+            heapUsedBytes = memSnapshot.heapUsedBytes,
+            rssBytes = memSnapshot.rssBytes
           )
 
           history :+= metrics
@@ -422,10 +478,16 @@ object Trainer:
             bestEpoch = globalEpoch
 
           display.onEpochComplete(metrics, isBest = isBest, patienceCounter = patienceCounter, patience = cfg.patience)
+          try onSafePoint(params)
+          catch case NonFatal(_) => ()
           earlyStopMessage.foreach(println)
 
           if interrupted then
-            saveDecision = resolveInterruptDecision(interactive)
+            saveDecision =
+              if promptOnInterrupt then resolveInterruptDecision(interactive)
+              else
+                println("\nInterrupted: defaulting to save best-so-far in sbt-managed/non-prompt mode.")
+                SaveDecision.SaveBest
             saveDecision match
               case SaveDecision.SaveBest =>
                 if bestEpoch == 0 then
@@ -461,13 +523,20 @@ object Trainer:
         case SaveDecision.SaveCurrent => params
         case SaveDecision.SaveBest    => bestParams
         case SaveDecision.Discard     => params
+      try onSafePoint(finalParams)
+      catch case NonFatal(_) => ()
 
       TrainResult(
         params = finalParams,
         history = history,
         interrupted = interrupted,
         saveDecision = saveDecision,
-        replayBuffer = buffer
+        replayBuffer = buffer,
+        requestedBackend = cfg.backend,
+        effectiveBackend = backend.name,
+        backendDiagnostics = backend.diagnostics,
+        gpuOpsEnabled = backend.gpuOpsEnabled.toVector.sorted,
+        backendProfileSummary = backend.profileSummary
       )
     finally
       restoreInterruptHandler(previousSignalHandler)
