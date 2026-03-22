@@ -14,6 +14,7 @@ project/project/
 # Models (keep vocab, ignore checkpoints)
 data/models/*.ckpt
 data/models/*.vocab
+data/models/*.replay
 data/metrics/
 
 # Corpus policy: only keep the small example corpus tracked
