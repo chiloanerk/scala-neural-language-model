@@ -22,6 +22,13 @@ Observed local performance on M1 (example runs):
   - GPU: `1299.6 ex/s`
   - Speedup: `9.55x`
 
+Latest recorded performance (March 22, 2026, from `data/metrics`):
+
+- Train (GPU fp32): `997.72 ex/s` (`train-2026-03-22T03-30-19.508107Z-d1c4cd5f`)
+- Previous train baseline: `970.80 ex/s` (`train-2026-03-22T03-29-16.680726Z-0e355956`)
+- Train delta vs baseline: `+2.77%`
+- Benchmark (CPU fp64, label `smoke`): `1264.17 ex/s` (`benchmark-2026-03-22T03-08-39.129693Z-463af53a`)
+
 ## Requirements
 
 - Java 21+
