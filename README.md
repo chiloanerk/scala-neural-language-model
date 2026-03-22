@@ -128,6 +128,11 @@ Key options:
 - `--replayBufferPath FILE` (optional; default `data/models/latest.replay` when replay is enabled)
 - `--ewcLambda VALUE` (default: `0.0`, off)
 - `--ewcSamples N` (optional EWC sampling count)
+- `--recordMetrics true|false` (default: `true`)
+- `--metricsDir DIR` (default: `data/metrics`)
+- `--runLabel TEXT` (optional label for grouping/comparison)
+- `--compareTo latest|RUN_ID|LABEL` (optional baseline selector)
+- `--regressionWarnPct VALUE` (default: `5.0`, warn-only)
 - `--yes` (auto-confirm final prompt)
 
 Preset learning rates:
@@ -208,6 +213,35 @@ Options:
 - `--batchSize N`
 - `--backend cpu|gpu` (optional filter; default runs both)
 - `--precision fp64|fp32` (optional filter; default runs both)
+- `--recordMetrics true|false` (default: `true`)
+- `--metricsDir DIR` (default: `data/metrics`)
+- `--runLabel TEXT` (optional label for grouping/comparison)
+- `--compareTo latest|RUN_ID|LABEL` (optional baseline selector)
+- `--regressionWarnPct VALUE` (default: `5.0`, warn-only)
+
+### `metrics-report`
+
+```bash
+sbt "run metrics-report --metricsDir data/metrics --mode train --compareTo latest"
+```
+
+Options:
+
+- `--metricsDir DIR` (default: `data/metrics`)
+- `--mode train|benchmark` (optional filter)
+- `--compareTo latest|RUN_ID|LABEL` (optional baseline selector)
+- `--regressionWarnPct VALUE` (default: `5.0`)
+
+## Metrics Workflow
+
+- Each `train` / `benchmark` run appends one JSON record to `data/metrics/runs.jsonl`.
+- A compact index for baseline resolution is maintained in `data/metrics/runs-index.tsv`.
+- Human-readable outputs:
+  - `data/metrics/latest-summary.txt`
+  - `data/metrics/latest-diff-summary.txt` (when a baseline is available)
+- Throughput regression policy is warn-only by default: warning at `>5%` slowdown.
+- GPU usage truth includes requested backend, effective backend, enabled GPU ops, diagnostics, and backend profile summary.
+- Memory captures JVM heap/non-heap plus process RSS at run start/end, with epoch snapshots contributing to peak values during training.
 
 ## Training Data Guide
 

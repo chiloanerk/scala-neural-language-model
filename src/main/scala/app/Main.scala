@@ -5,10 +5,13 @@ import data.{TextPipeline, VocabIO}
 import eval.Metrics
 import linalg.LinearAlgebra
 import nn.{LanguageModel, ModelConfig}
+import observability.{GpuHotPathMetrics, MemoryMetrics, MemoryProbe, RunMetrics, RunObservability, RunProfile}
 import train.{CheckpointIO, ReplayBuffer, SaveDecision, TrainConfig, Trainer}
 
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
+import java.util.Properties
 import scala.io.StdIn
 import scala.jdk.CollectionConverters._
 import scala.util.Using
@@ -27,6 +30,9 @@ object Main:
   val ModelPath = Path.of("data/models/latest.ckpt")
   val VocabPath = Path.of("data/models/latest.vocab")
   val ReplayPath = Path.of("data/models/latest.replay")
+  val InterruptModelPath = Path.of("data/models/latest.interrupt.ckpt")
+  val InterruptVocabPath = Path.of("data/models/latest.interrupt.vocab")
+  val InterruptMetaPath = Path.of("data/models/latest.interrupt.meta")
 
   // Training presets
   case class Preset(
@@ -53,6 +59,59 @@ object Main:
 
   private def defaultPrecisionForBackend(backend: String): String =
     "fp64"
+
+  private def loadInterruptMeta(path: Path): Map[String, String] =
+    if !Files.isRegularFile(path) then Map.empty
+    else
+      try
+        val props = Properties()
+        val in = Files.newInputStream(path)
+        try props.load(in)
+        finally in.close()
+        props.stringPropertyNames().asScala.map(k => k -> props.getProperty(k)).toMap
+      catch
+        case _: Exception => Map.empty
+
+  private def saveInterruptMeta(path: Path, values: Map[String, String]): Unit =
+    val props = Properties()
+    values.foreach { case (k, v) => props.setProperty(k, v) }
+    Files.createDirectories(path.getParent)
+    val out = Files.newOutputStream(path)
+    try props.store(out, "interrupt training metadata")
+    finally out.close()
+
+  private def cleanupInterruptArtifacts(): Vector[Path] =
+    Vector(InterruptModelPath, InterruptVocabPath, InterruptMetaPath).flatMap { p =>
+      try
+        if Files.deleteIfExists(p) then Some(p) else None
+      catch
+        case _: Exception => None
+    }
+
+  private def parseObservabilitySettings(flags: Map[String, String]): RunObservability.Settings =
+    val recordMetrics = flags.get("recordMetrics").map(v => CliHelpers.parseYesNo(v, default = true)).getOrElse(true)
+    val metricsDir = Path.of(flags.getOrElse("metricsDir", RunObservability.DefaultMetricsDir.toString))
+    val runLabel = flags.get("runLabel").map(_.trim).filter(_.nonEmpty)
+    val compareTo = flags.get("compareTo").map(_.trim).filter(_.nonEmpty)
+    val regressionWarnPct = flags.get("regressionWarnPct").flatMap(_.toDoubleOption).getOrElse(5.0)
+    RunObservability.Settings(
+      recordMetrics = recordMetrics,
+      metricsDir = metricsDir,
+      runLabel = runLabel,
+      compareTo = compareTo,
+      regressionWarnPct = regressionWarnPct
+    )
+
+  private def peakMemory(start: MemoryMetrics, end: MemoryMetrics, epochHeap: Vector[Long], epochRss: Vector[Long]): MemoryMetrics =
+    val heapPeak = (epochHeap :+ start.heapUsedBytes :+ end.heapUsedBytes).maxOption.getOrElse(start.heapUsedBytes)
+    val rssPeak = (epochRss :+ start.rssBytes :+ end.rssBytes).maxOption.getOrElse(start.rssBytes)
+    MemoryMetrics(
+      timestampEpochMs = math.max(start.timestampEpochMs, end.timestampEpochMs),
+      heapUsedBytes = heapPeak,
+      heapCommittedBytes = math.max(start.heapCommittedBytes, end.heapCommittedBytes),
+      nonHeapUsedBytes = math.max(start.nonHeapUsedBytes, end.nonHeapUsedBytes),
+      rssBytes = rssPeak
+    )
 
   private[app] def benchmarkMatrix(backendFlag: Option[String], precisionFlag: Option[String]): Vector[(String, String)] =
     val backends = backendFlag match
@@ -86,6 +145,7 @@ object Main:
       case "chunk"   => runChunker(CliHelpers.parseArgs(args.drop(1)))
       case "gpu-info" => runGpuInfo(CliHelpers.parseArgs(args.drop(1)))
       case "benchmark" => runBenchmark(CliHelpers.parseArgs(args.drop(1)))
+      case "metrics-report" => runMetricsReport(CliHelpers.parseArgs(args.drop(1)))
       case "test"    => TestRunner.main(Array.empty)
       case _ =>
         printUsage()
@@ -109,6 +169,7 @@ object Main:
       |  chunk   - Split large files into training chunks
       |  gpu-info - Check Metal/JNI status
       |  benchmark - Compare CPU/GPU throughput estimate
+      |  metrics-report - Show persisted metrics summaries/comparisons
       |  test    - Run built-in tests
       |
       |Quick start:
@@ -120,16 +181,43 @@ object Main:
 
   private def runTrain(flags: Map[String, String]): Unit =
     println("\n=== Training ===\n")
+    val observability = parseObservabilitySettings(flags)
+    val runStartMs = System.currentTimeMillis()
+    val memoryStart = MemoryProbe.snapshot(runStartMs)
 
     val freshTraining = flags.get("fresh").exists(CliHelpers.isTruthy)
-    val hasExistingModel = Files.isRegularFile(ModelPath)
-    val inputFlag = flags.get("input").map(_.trim).filter(_.nonEmpty)
-    val inputsFlag = flags.get("inputs").map(_.trim).filter(_.nonEmpty)
+    val interruptAvailable = Files.isRegularFile(InterruptModelPath) && Files.isRegularFile(InterruptVocabPath)
+    val interruptNewerThanLatest =
+      if !interruptAvailable then false
+      else if !Files.isRegularFile(ModelPath) then true
+      else Files.getLastModifiedTime(InterruptModelPath).toMillis >= Files.getLastModifiedTime(ModelPath).toMillis
+    val autoResumeInterrupt = !freshTraining && interruptAvailable && interruptNewerThanLatest
+    val interruptMeta = if autoResumeInterrupt then loadInterruptMeta(InterruptMetaPath) else Map.empty
+    val effectiveFlags =
+      if autoResumeInterrupt then
+        val merged = scala.collection.mutable.Map.from(flags ++ interruptMeta.filterNot { case (k, _) => flags.contains(k) })
+        if flags.contains("input") then merged.remove("inputs")
+        if flags.contains("inputs") then merged.remove("input")
+        if flags.contains("input") || flags.contains("inputs") then
+          if !flags.contains("inputWeights") then merged.remove("inputWeights")
+        merged.toMap
+      else flags
+
+    val activeModelPath = if autoResumeInterrupt then InterruptModelPath else ModelPath
+    val activeVocabPath = if autoResumeInterrupt then InterruptVocabPath else VocabPath
+    if autoResumeInterrupt then
+      println(s"Found interrupt snapshot newer than latest model.")
+      println(s"Auto-resuming from: ${displayPath(activeModelPath)}")
+      if interruptMeta.nonEmpty then println("Inherited prior run settings from interrupt metadata.")
+
+    val hasExistingModel = Files.isRegularFile(activeModelPath)
+    val inputFlag = effectiveFlags.get("input").map(_.trim).filter(_.nonEmpty)
+    val inputsFlag = effectiveFlags.get("inputs").map(_.trim).filter(_.nonEmpty)
 
     require(!(inputFlag.isDefined && inputsFlag.isDefined), "Use only one of --input or --inputs.")
 
-    val actuallyFresh = if hasExistingModel && !freshTraining && inputFlag.isEmpty && inputsFlag.isEmpty then
-      println(s"Found existing model: ${displayPath(ModelPath)} (${Files.size(ModelPath) / 1024} KB)")
+    val actuallyFresh = if hasExistingModel && !freshTraining && inputFlag.isEmpty && inputsFlag.isEmpty && !autoResumeInterrupt then
+      println(s"Found existing model: ${displayPath(activeModelPath)} (${Files.size(activeModelPath) / 1024} KB)")
       println()
       println("Choose action:")
       println("  1. Continue training (default)")
@@ -137,12 +225,15 @@ object Main:
       println()
       val raw = readTrimmedRequired("Select [1]: ", "select action")
       CliHelpers.parseMenuChoice(raw, optionCount = 2, defaultIndex = 0).contains(1)
+    else if autoResumeInterrupt then
+      println("Continuing from interrupt snapshot (auto-resume).\n")
+      false
     else if freshTraining then
       println("Starting fresh training (ignoring any existing model).\n")
       true
     else if hasExistingModel then
-      val size = Files.size(ModelPath) / 1024
-      println(s"Found existing model: ${displayPath(ModelPath)} (${size} KB)")
+      val size = Files.size(activeModelPath) / 1024
+      println(s"Found existing model: ${displayPath(activeModelPath)} (${size} KB)")
       println("This will continue training from where you left off.\n")
       false
     else
@@ -159,12 +250,12 @@ object Main:
     require(inputPaths.nonEmpty, "No input files provided.")
     inputPaths.foreach(p => require(Files.isRegularFile(p), s"Input file not found: $p"))
 
-    val existingCfg = if hasExistingModel && !actuallyFresh && Files.isRegularFile(ModelPath) then
-      Some(CheckpointIO.load(ModelPath)._2)
+    val existingCfg = if hasExistingModel && !actuallyFresh && Files.isRegularFile(activeModelPath) then
+      Some(CheckpointIO.load(activeModelPath)._2)
     else
       None
 
-    val presetName = flags.getOrElse("preset", {
+    val presetName = effectiveFlags.getOrElse("preset", {
       println("\nChoose training quality:")
       presets.zipWithIndex.foreach { case (p, idx) =>
         println(s"  ${idx + 1}. ${p.name.capitalize} - ${p.description} (${p.epochs} epochs, patience=${p.patience})")
@@ -179,8 +270,8 @@ object Main:
     }
 
     val autoConfirm = flags.get("yes").exists(CliHelpers.isTruthy)
-    val backend = BackendSelector.normalizeBackend(flags.getOrElse("backend", "gpu"))
-    val precision = flags.get("precision") match
+    val backend = BackendSelector.normalizeBackend(effectiveFlags.getOrElse("backend", "gpu"))
+    val precision = effectiveFlags.get("precision") match
       case Some(raw) => BackendSelector.normalizePrecision(raw)
       case None =>
         val defaultPrecision = defaultPrecisionForBackend(backend)
@@ -194,20 +285,20 @@ object Main:
           CliHelpers.parseMenuChoice(raw, optionCount = 2, defaultIndex = defaultIdx).getOrElse(defaultIdx) match
             case 1 => "fp32"
             case _ => "fp64"
-    val learningRate = flags.get("lr").flatMap(_.toDoubleOption).getOrElse(preset.learningRate)
-    val lrDecay = flags.get("lrDecay").flatMap(_.toDoubleOption).getOrElse(1.0)
-    val batchSize = flags.get("batchSize").flatMap(_.toIntOption).getOrElse(0)
-    val prefetch = flags.get("prefetch").flatMap(_.toIntOption).getOrElse(1)
-    val profileGpu = flags.get("profileGpu").exists(CliHelpers.isTruthy)
-    val replayFlagsProvided = flags.contains("replayRatio") || flags.contains("replayBufferSize") || flags.contains("replayBufferPath")
+    val learningRate = effectiveFlags.get("lr").flatMap(_.toDoubleOption).getOrElse(preset.learningRate)
+    val lrDecay = effectiveFlags.get("lrDecay").flatMap(_.toDoubleOption).getOrElse(1.0)
+    val batchSize = effectiveFlags.get("batchSize").flatMap(_.toIntOption).getOrElse(0)
+    val prefetch = effectiveFlags.get("prefetch").flatMap(_.toIntOption).getOrElse(1)
+    val profileGpu = effectiveFlags.get("profileGpu").exists(CliHelpers.isTruthy)
+    val replayFlagsProvided = effectiveFlags.contains("replayRatio") || effectiveFlags.contains("replayBufferSize") || effectiveFlags.contains("replayBufferPath")
     val replayFileDefault = ReplayPath
     val replayFileExists = Files.isRegularFile(replayFileDefault)
-    var replayRatio = flags.get("replayRatio").flatMap(_.toDoubleOption).getOrElse(0.3)
-    var replayBufferSize = flags.get("replayBufferSize").flatMap(_.toIntOption).getOrElse(0)
-    var replayBufferPath = flags.get("replayBufferPath").map(Path.of(_))
-    val ewcLambda = flags.get("ewcLambda").flatMap(_.toDoubleOption).getOrElse(0.0)
-    val ewcSamples = flags.get("ewcSamples").flatMap(_.toIntOption).getOrElse(0)
-    if flags.get("gpuInfo").exists(CliHelpers.isTruthy) then
+    var replayRatio = effectiveFlags.get("replayRatio").flatMap(_.toDoubleOption).getOrElse(0.3)
+    var replayBufferSize = effectiveFlags.get("replayBufferSize").flatMap(_.toIntOption).getOrElse(0)
+    var replayBufferPath = effectiveFlags.get("replayBufferPath").map(Path.of(_))
+    val ewcLambda = effectiveFlags.get("ewcLambda").flatMap(_.toDoubleOption).getOrElse(0.0)
+    val ewcSamples = effectiveFlags.get("ewcSamples").flatMap(_.toIntOption).getOrElse(0)
+    if effectiveFlags.get("gpuInfo").exists(CliHelpers.isTruthy) then
       println(s"GPU info: ${BackendSelector.gpuInfo(precision)}")
 
     if !replayFlagsProvided then
@@ -254,7 +345,7 @@ object Main:
     require(replayBufferSize >= 0, s"--replayBufferSize must be >=0, got $replayBufferSize")
     require(ewcLambda == 0.0, "--ewcLambda is not implemented yet. Keep it at 0.0 for now.")
 
-    val contextSize = flags.get("contextSize").map(_.toInt).getOrElse {
+    val contextSize = effectiveFlags.get("contextSize").map(_.toInt).getOrElse {
       existingCfg match
         case Some(cfg) =>
           println(s"\nUsing existing model architecture: context=${cfg.contextSize}")
@@ -263,7 +354,7 @@ object Main:
           val raw = readTrimmedRequired("\nContext size (words to look back) [3]: ", "context size")
           raw.toIntOption.getOrElse(3)
     }
-    val maxVocab = flags.get("maxVocab").map(_.toInt).getOrElse {
+    val maxVocab = effectiveFlags.get("maxVocab").map(_.toInt).getOrElse {
       existingCfg match
         case Some(cfg) =>
           println(s"Using existing model vocabulary size: ${cfg.vocabSize}")
@@ -273,7 +364,17 @@ object Main:
           raw.toIntOption.getOrElse(3000)
     }
 
-    val inputWeights = parseInputWeights(flags.get("inputWeights"), inputPaths.length)
+    val rawInputWeights = effectiveFlags.get("inputWeights")
+    val sanitizedInputWeights =
+      if flags.contains("inputWeights") then rawInputWeights
+      else
+        rawInputWeights.filter { csv =>
+          val count = csv.split(",").toVector.map(_.trim).count(_.nonEmpty)
+          count == inputPaths.length
+        }
+    if autoResumeInterrupt && rawInputWeights.isDefined && sanitizedInputWeights.isEmpty then
+      println("Ignoring incompatible inherited inputWeights from interrupt metadata.")
+    val inputWeights = parseInputWeights(sanitizedInputWeights, inputPaths.length)
     Files.createDirectories(ModelPath.getParent)
 
     println(s"\n=== Summary ===")
@@ -321,10 +422,10 @@ object Main:
 
     val loadedInputs = inputPaths.map(path => readTextRobust(path, autoConfirm))
     val tokenizedInputs = loadedInputs.map { case (_, text) => TextPipeline.tokenize(text) }
-    val vocab = if actuallyFresh || !Files.isRegularFile(VocabPath) then
+    val vocab = if actuallyFresh || !Files.isRegularFile(activeVocabPath) then
       TextPipeline.buildVocab(tokenizedInputs.flatten.toVector, maxVocab)
     else
-      VocabIO.load(VocabPath)
+      VocabIO.load(activeVocabPath)
 
     val modelCfg = ModelConfig(
       contextSize = contextSize,
@@ -334,8 +435,8 @@ object Main:
       activation = "tanh"
     )
 
-    val params0 = if hasExistingModel && !actuallyFresh && Files.isRegularFile(ModelPath) then
-      val (existingParams, cfg) = CheckpointIO.load(ModelPath)
+    val params0 = if hasExistingModel && !actuallyFresh && Files.isRegularFile(activeModelPath) then
+      val (existingParams, cfg) = CheckpointIO.load(activeModelPath)
       println(s"Loaded existing model (vocab: ${cfg.vocabSize} words, context: ${cfg.contextSize}, embed: ${cfg.embedDim}, hidden: ${cfg.hiddenDim})")
       existingParams
     else
@@ -386,15 +487,67 @@ object Main:
       ewcLambda = ewcLambda,
       ewcSamples = ewcSamples
     )
+    val interruptMetaValues = Map(
+      "preset" -> preset.name,
+      "backend" -> backend,
+      "precision" -> precision,
+      "lr" -> learningRate.toString,
+      "lrDecay" -> lrDecay.toString,
+      "batchSize" -> batchSize.toString,
+      "prefetch" -> prefetch.toString,
+      "replayRatio" -> replayRatio.toString,
+      "replayBufferSize" -> replayBufferSize.toString,
+      "replayBufferPath" -> replayBufferPath.map(_.toString).getOrElse(""),
+      "contextSize" -> contextSize.toString,
+      "maxVocab" -> maxVocab.toString,
+      "input" -> (if inputPaths.length == 1 then inputPaths.head.toString else ""),
+      "inputs" -> (if inputPaths.length > 1 then inputPaths.map(_.toString).mkString(",") else ""),
+      "inputWeights" -> inputWeights.map(w => f"$w%.6f").mkString(",")
+    ).filter(_._2.nonEmpty)
 
     val usePhasedTraining =
       phases.length > 1 || replayRatio > 0.0 || replayState.nonEmpty || replayPersistenceEnabled
 
+    val safePointParams = AtomicReference(params0)
+    val trainingInProgress = AtomicBoolean(true)
+    val shutdownHook = new Thread(() =>
+      if trainingInProgress.get() then
+        try
+          CheckpointIO.save(safePointParams.get(), modelCfg, InterruptModelPath)
+          VocabIO.save(vocab, InterruptVocabPath)
+          saveInterruptMeta(InterruptMetaPath, interruptMetaValues)
+          Console.err.println(s"[interrupt-save] Emergency checkpoint: ${displayPath(InterruptModelPath)}")
+          Console.err.println(s"[interrupt-save] Emergency vocab: ${displayPath(InterruptVocabPath)}")
+          Console.err.println(s"[interrupt-save] Emergency settings: ${displayPath(InterruptMetaPath)}")
+        catch
+          case _: Exception => ()
+    )
+    Runtime.getRuntime.addShutdownHook(shutdownHook)
+
     val result =
-      if usePhasedTraining then
-        Trainer.trainPhased(params0, phases, trainCfg, replayState)
-      else
-        Trainer.train(params0, phases.head.trainSet, phases.head.valSet, trainCfg)
+      try
+        if usePhasedTraining then
+          Trainer.trainPhased(
+            params0,
+            phases,
+            trainCfg,
+            replayState,
+            onSafePoint = p => safePointParams.set(p)
+          )
+        else
+          Trainer.train(
+            params0,
+            phases.head.trainSet,
+            phases.head.valSet,
+            trainCfg,
+            onSafePoint = p => safePointParams.set(p)
+          )
+      finally
+        trainingInProgress.set(false)
+        try Runtime.getRuntime.removeShutdownHook(shutdownHook)
+        catch case _: IllegalStateException => ()
+    val runEndMs = System.currentTimeMillis()
+    val memoryEnd = MemoryProbe.snapshot(runEndMs)
 
     val shouldSave = result.saveDecision != SaveDecision.Discard
     if shouldSave then
@@ -402,6 +555,9 @@ object Main:
       VocabIO.save(vocab, VocabPath)
       if replayPersistenceEnabled then
         result.replayBuffer.foreach(_.save(replayFile))
+      val cleanedInterruptArtifacts = cleanupInterruptArtifacts()
+      if cleanedInterruptArtifacts.nonEmpty then
+        println("  Interrupt recovery artifacts cleaned up.")
 
     println("\n=== Results ===")
     val bestMetric = result.history.minBy(_.valLoss)
@@ -438,6 +594,70 @@ object Main:
     if trainCfg.patience > 0 && result.history.nonEmpty then
       val last = result.history.last
       println(f"  Last epoch (pre-restore): val_loss=${last.valLoss}%.4f val_ppl=${last.valPerplexity}%.1f")
+
+    val epochHeap = result.history.map(_.heapUsedBytes).filter(_ >= 0)
+    val epochRss = result.history.map(_.rssBytes).filter(_ >= 0)
+    val memoryPeak = peakMemory(memoryStart, memoryEnd, epochHeap, epochRss)
+    val throughput = if result.history.isEmpty then 0.0 else result.history.map(_.examplesPerSec).sum / result.history.length.toDouble
+    val finalEpoch = result.history.lastOption
+    val finalDomainLosses = finalEpoch.map(_.perDomainValMetrics.map(m => m.domain -> m.valLoss)).getOrElse(Vector.empty)
+    val finalRetention = finalEpoch.map(_.retentionMetrics.map(m => m.domain -> m.retentionPct)).getOrElse(Vector.empty)
+    val runProfile = RunProfile(
+      totalSeconds = (runEndMs - runStartMs).toDouble / 1000.0,
+      epochSecondsTotal = result.history.map(_.epochSeconds).sum,
+      epochSecondsAvg = if result.history.isEmpty then 0.0 else result.history.map(_.epochSeconds).sum / result.history.length.toDouble,
+      batchMillisAvg = if result.history.isEmpty then 0.0 else result.history.map(_.avgBatchMillis).sum / result.history.length.toDouble,
+      batchMillisP95 = if result.history.isEmpty then 0.0 else result.history.map(_.p95BatchMillis).sum / result.history.length.toDouble,
+      backendProfileSummary = result.backendProfileSummary
+    )
+    val gpuMetrics = GpuHotPathMetrics(
+      requestedBackend = result.requestedBackend,
+      effectiveBackend = result.effectiveBackend,
+      diagnostics = result.backendDiagnostics,
+      enabledOps = result.gpuOpsEnabled,
+      profileSummary = result.backendProfileSummary,
+      fallbackDetected = result.requestedBackend == "gpu" && result.effectiveBackend != "gpu"
+    )
+    val runMetrics = RunMetrics(
+      runId = RunObservability.buildRunId("train"),
+      timestampEpochMs = runEndMs,
+      mode = "train",
+      runLabel = observability.runLabel,
+      configFingerprint = RunObservability.configFingerprint(
+        Vector(
+          "preset" -> preset.name,
+          "contextSize" -> contextSize.toString,
+          "maxVocab" -> maxVocab.toString,
+          "backend" -> backend,
+          "precision" -> precision,
+          "lr" -> learningRate.toString,
+          "batchSize" -> batchSize.toString,
+          "epochs" -> preset.epochs.toString,
+          "replayRatio" -> replayRatio.toString
+        )
+      ),
+      dataset = inputPaths.map(displayPath).mkString(","),
+      requestedBackend = backend,
+      precision = precision,
+      throughputExPerSec = throughput,
+      trainLoss = finalEpoch.map(_.trainLoss),
+      valLoss = finalEpoch.map(_.valLoss),
+      valPerplexity = finalEpoch.map(_.valPerplexity),
+      epochs = result.history.length,
+      domainValLosses = finalDomainLosses,
+      retentionByDomainPct = finalRetention,
+      profile = runProfile,
+      gpu = gpuMetrics,
+      memoryStart = memoryStart,
+      memoryEnd = memoryEnd,
+      memoryPeak = memoryPeak,
+      notes = Map(
+        "saveDecision" -> result.saveDecision.toString,
+        "interrupted" -> result.interrupted.toString,
+        "modelSaved" -> shouldSave.toString
+      )
+    )
+    RunObservability.persistAndReport(runMetrics, observability)
     println()
     println("Continue with: sbt \"run train --inputs <more1.txt,more2.txt>\"")
     println("Or predict:    sbt \"run predict --context 'your text'\"")
@@ -724,6 +944,9 @@ object Main:
 
   private def runBenchmark(flags: Map[String, String]): Unit =
     println("\n=== Benchmark ===")
+    val observability = parseObservabilitySettings(flags)
+    val runStartMs = System.currentTimeMillis()
+    val memoryStart = MemoryProbe.snapshot(runStartMs)
     val inputPath = Path.of(flags.getOrElse("input", "data/corpus/example-corpus.txt"))
     if !Files.isRegularFile(inputPath) then
       println(s"Input file not found: $inputPath")
@@ -749,7 +972,16 @@ object Main:
     val cfg = ModelConfig(contextSize = contextSize, embedDim = 24, hiddenDim = 64, vocabSize = vocab.size, activation = activation)
     val params = LanguageModel.initParams(cfg, seed = 42)
 
-    def bench(label: String, backendName: String, precision: String): Double =
+    final case class BenchResult(
+        exPerSec: Double,
+        estSec: Double,
+        diagnostics: String,
+        effectiveBackend: String,
+        enabledOps: Vector[String],
+        profileSummary: String
+    )
+
+    def bench(label: String, backendName: String, precision: String): BenchResult =
       val backend = BackendSelector.fromConfig(backendName, precision, warn = _ => ())
       backend.resetProfile()
       val trainCfg = TrainConfig(epochs = 1, activation = activation, backend = backendName, precision = precision, batchSize = batchSize, profileGpu = true)
@@ -757,19 +989,26 @@ object Main:
       val exPerSec = if sec <= 0 then 0.0 else examples.length / sec
       println(f"$label%-4s backend=${backend.diagnostics} | est=${sec}%.2fs for ${examples.length} ex | ${exPerSec}%.1f ex/s")
       if backend.isGpu then println(s"     profile=${backend.profileSummary}")
-      exPerSec
+      BenchResult(
+        exPerSec = exPerSec,
+        estSec = sec,
+        diagnostics = backend.diagnostics,
+        effectiveBackend = backend.name,
+        enabledOps = backend.gpuOpsEnabled.toVector.sorted,
+        profileSummary = backend.profileSummary
+      )
 
-    val results = scala.collection.mutable.Map.empty[(String, String), Double]
+    val results = scala.collection.mutable.Map.empty[(String, String), BenchResult]
     val combos = benchmarkMatrix(benchmarkBackendFlag, precisionFlag)
     combos.foreach { case (backendName, precision) =>
       val label = s"${backendName.toUpperCase}[$precision]"
-      val exPerSec = bench(label, backendName, precision)
-      results((backendName, precision)) = exPerSec
+      val res = bench(label, backendName, precision)
+      results((backendName, precision)) = res
     }
 
     Vector("fp64", "fp32").foreach { precision =>
-      val cpu = results.get(("cpu", precision))
-      val gpu = results.get(("gpu", precision))
+      val cpu = results.get(("cpu", precision)).map(_.exPerSec)
+      val gpu = results.get(("gpu", precision)).map(_.exPerSec)
       (cpu, gpu) match
         case (Some(c), Some(g)) if c > 0 && g > 0 =>
           println(f"Speedup (GPU/CPU, $precision): ${g / c}%.2fx")
@@ -807,6 +1046,99 @@ object Main:
       opBackends.foreach { b =>
         benchOps(b.toUpperCase, b)
       }
+    }
+
+    val runEndMs = System.currentTimeMillis()
+    val memoryEnd = MemoryProbe.snapshot(runEndMs)
+    val throughputValues = results.values.map(_.exPerSec).filter(_ > 0).toVector
+    val throughput = if throughputValues.isEmpty then 0.0 else throughputValues.sum / throughputValues.length.toDouble
+    val preferredResult = results.headOption.map(_._2)
+    val memoryPeak = peakMemory(memoryStart, memoryEnd, Vector.empty, Vector.empty)
+    val runMetrics = RunMetrics(
+      runId = RunObservability.buildRunId("benchmark"),
+      timestampEpochMs = runEndMs,
+      mode = "benchmark",
+      runLabel = observability.runLabel,
+      configFingerprint = RunObservability.configFingerprint(
+        Vector(
+          "input" -> inputPath.toString,
+          "contextSize" -> contextSize.toString,
+          "maxVocab" -> maxVocab.toString,
+          "sample" -> sample.toString,
+          "backendFilter" -> benchmarkBackendFlag.getOrElse("all"),
+          "precisionFilter" -> precisionFlag.getOrElse("all"),
+          "batchSize" -> batchSize.toString
+        )
+      ),
+      dataset = displayPath(inputPath),
+      requestedBackend = benchmarkBackendFlag.getOrElse("all"),
+      precision = precisionFlag.getOrElse("all"),
+      throughputExPerSec = throughput,
+      trainLoss = None,
+      valLoss = None,
+      valPerplexity = None,
+      epochs = 0,
+      domainValLosses = Vector.empty,
+      retentionByDomainPct = Vector.empty,
+      profile = RunProfile(
+        totalSeconds = (runEndMs - runStartMs).toDouble / 1000.0,
+        epochSecondsTotal = results.values.map(_.estSec).sum,
+        epochSecondsAvg = if results.isEmpty then 0.0 else results.values.map(_.estSec).sum / results.size.toDouble,
+        batchMillisAvg = 0.0,
+        batchMillisP95 = 0.0,
+        backendProfileSummary = preferredResult.map(_.profileSummary).getOrElse("")
+      ),
+      gpu = GpuHotPathMetrics(
+        requestedBackend = benchmarkBackendFlag.getOrElse("all"),
+        effectiveBackend = preferredResult.map(_.effectiveBackend).getOrElse("cpu"),
+        diagnostics = preferredResult.map(_.diagnostics).getOrElse("n/a"),
+        enabledOps = preferredResult.map(_.enabledOps).getOrElse(Vector.empty),
+        profileSummary = preferredResult.map(_.profileSummary).getOrElse(""),
+        fallbackDetected = benchmarkBackendFlag.contains("gpu") && preferredResult.exists(_.effectiveBackend != "gpu")
+      ),
+      memoryStart = memoryStart,
+      memoryEnd = memoryEnd,
+      memoryPeak = memoryPeak,
+      notes = results.toVector.sortBy(_._1.toString).map { case ((b, p), r) =>
+        s"${b}_$p" -> f"${r.exPerSec}%.2f ex/s; est=${r.estSec}%.2fs"
+      }.toMap
+    )
+    RunObservability.persistAndReport(runMetrics, observability)
+
+  private def runMetricsReport(flags: Map[String, String]): Unit =
+    println("\n=== Metrics Report ===")
+    val metricsDir = Path.of(flags.getOrElse("metricsDir", RunObservability.DefaultMetricsDir.toString))
+    val modeFilter = flags.get("mode").map(_.trim.toLowerCase).filter(_.nonEmpty)
+    val compareTo = flags.get("compareTo").map(_.trim).filter(_.nonEmpty)
+    val regressionWarnPct = flags.get("regressionWarnPct").flatMap(_.toDoubleOption).getOrElse(5.0)
+
+    val index = RunObservability.loadIndex(metricsDir)
+    if index.isEmpty then
+      println(s"No persisted metrics found in ${displayPath(metricsDir)}")
+      return
+
+    val filtered = modeFilter match
+      case Some(mode) => index.filter(_.mode == mode)
+      case None       => index
+    val latest = filtered.sortBy(_.timestampEpochMs).lastOption
+
+    println(s"Metrics dir: ${displayPath(metricsDir)}")
+    println(s"Runs in scope: ${filtered.length}")
+    println("Recent runs:")
+    filtered.sortBy(_.timestampEpochMs).takeRight(10).foreach { r =>
+      val label = r.runLabel.getOrElse("-")
+      println(f"  ${r.runId}%-46s mode=${r.mode}%-9s throughput=${r.throughputExPerSec}%.2f ex/s label=$label")
+    }
+
+    latest.foreach { current =>
+      println(s"\nCurrent run for comparison: ${current.runId} (${current.mode})")
+      val baseline = RunObservability.selectBaseline(filtered, current, compareTo)
+      baseline.foreach { base =>
+        val regression = RunObservability.throughputRegression(base, current, regressionWarnPct)
+        println(RunObservability.renderDiffSummary(current, base, regression))
+      }
+      if baseline.isEmpty then
+        println("No baseline run matched the compare target. Use --compareTo latest|<runId>|<runLabel>.")
     }
 
   private def adaptContext(ids: Vector[Int], contextSize: Int, padId: Int): Vector[Int] =
@@ -875,6 +1207,7 @@ object Main:
         |  sbt "runMain app.Main chunk"        Split large files into chunks
         |  sbt "runMain app.Main gpu-info"     Show Metal/JNI status
         |  sbt "runMain app.Main benchmark"    Compare CPU/GPU throughput estimate
+        |  sbt "runMain app.Main metrics-report" Show stored metrics history/comparisons
         |
         |Training:
         |  --input FILE      Training text file (single-input mode)
@@ -897,6 +1230,11 @@ object Main:
         |  --replayBufferPath FILE Optional replay file path
         |  --ewcLambda V     Optional EWC regularization strength (default: 0)
         |  --ewcSamples N    Optional EWC sample count
+        |  --recordMetrics B true|false (default: true)
+        |  --metricsDir DIR  Metrics output dir (default: data/metrics)
+        |  --runLabel TEXT   Optional run label for grouping/comparison
+        |  --compareTo REF   latest|runId|runLabel for baseline comparison
+        |  --regressionWarnPct N Warn threshold percent (default: 5.0)
         |
         |Chunking:
         |  --input FILE      File to split (required, or select interactively)
@@ -921,6 +1259,17 @@ object Main:
         |  --sample N        Number of examples (default: 2000)
         |  --precision MODE  fp64|fp32 (default: run both)
         |  --batchSize N     Batch size override for benchmark estimate
+        |  --recordMetrics B true|false (default: true)
+        |  --metricsDir DIR  Metrics output dir (default: data/metrics)
+        |  --runLabel TEXT   Optional run label for grouping/comparison
+        |  --compareTo REF   latest|runId|runLabel for baseline comparison
+        |  --regressionWarnPct N Warn threshold percent (default: 5.0)
+
+        |Metrics report:
+        |  --metricsDir DIR  Metrics dir to inspect (default: data/metrics)
+        |  --mode NAME       Optional filter: train|benchmark
+        |  --compareTo REF   latest|runId|runLabel for baseline comparison
+        |  --regressionWarnPct N Warn threshold percent (default: 5.0)
         |
         |Examples:
         |  sbt "runMain app.Main train --input data/corpus/text.txt"
