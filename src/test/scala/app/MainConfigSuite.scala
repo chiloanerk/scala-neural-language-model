@@ -91,6 +91,12 @@ class MainConfigSuite extends FunSuite:
     assertEquals(Main.resolveLauncherCommand("8"), None)
   }
 
+  test("shouldCleanupInterruptArtifactsOnCanceledStart only cleans canceled auto-resume runs") {
+    assertEquals(Main.shouldCleanupInterruptArtifactsOnCanceledStart(autoResumeInterrupt = true, confirmStart = false), true)
+    assertEquals(Main.shouldCleanupInterruptArtifactsOnCanceledStart(autoResumeInterrupt = true, confirmStart = true), false)
+    assertEquals(Main.shouldCleanupInterruptArtifactsOnCanceledStart(autoResumeInterrupt = false, confirmStart = false), false)
+  }
+
   test("utf8CopyPath inserts .utf8 before extension") {
     val got = Main.utf8CopyPath(java.nio.file.Path.of("data/corpus/bbc-all.txt"))
     assertEquals(got.toString, "data/corpus/bbc-all.utf8.txt")

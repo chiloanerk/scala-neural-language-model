@@ -263,6 +263,12 @@ object Main:
     CliHelpers.parseMenuChoice(raw, optionCount = LauncherCommands.length, defaultIndex = 0)
       .flatMap(launcherCommandForSelection)
 
+  private[app] def shouldCleanupInterruptArtifactsOnCanceledStart(
+      autoResumeInterrupt: Boolean,
+      confirmStart: Boolean
+  ): Boolean =
+    autoResumeInterrupt && !confirmStart
+
   private def readTrimmedRequired(prompt: String, field: String): String =
     Option(readLineWithPrompt(prompt)) match
       case Some(v) => v.trim
@@ -674,6 +680,10 @@ object Main:
           throw BackToLauncher
 
     if !confirm then
+      if shouldCleanupInterruptArtifactsOnCanceledStart(autoResumeInterrupt, confirm) then
+        val cleanedInterruptArtifacts = cleanupInterruptArtifacts()
+        if cleanedInterruptArtifacts.nonEmpty then
+          println("Cleared pending interrupt snapshot because resume was canceled.")
       println("Training canceled.")
       return
 
