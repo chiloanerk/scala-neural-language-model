@@ -341,6 +341,11 @@ metal-jni/
 - Quality depends heavily on corpus quality and training setup.
 - Use validation loss/perplexity for quality decisions; examples/sec is speed only.
 
+## Contributing
+
+Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR.
+It defines branch naming (`feature/*`, `bugfix/*`, `docs/*`, `chore/*`) and PR expectations.
+
 ## License
 
 This project is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**.
