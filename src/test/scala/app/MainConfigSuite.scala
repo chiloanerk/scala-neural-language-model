@@ -74,21 +74,23 @@ class MainConfigSuite extends FunSuite:
   test("launcherCommandForSelection maps menu indexes to commands") {
     assertEquals(Main.launcherCommandForSelection(0), Some("train"))
     assertEquals(Main.launcherCommandForSelection(1), Some("predict"))
-    assertEquals(Main.launcherCommandForSelection(2), Some("benchmark"))
-    assertEquals(Main.launcherCommandForSelection(3), Some("chunk"))
-    assertEquals(Main.launcherCommandForSelection(4), Some("gpu-info"))
-    assertEquals(Main.launcherCommandForSelection(5), Some("help"))
-    assertEquals(Main.launcherCommandForSelection(6), Some("exit"))
-    assertEquals(Main.launcherCommandForSelection(7), None)
+    assertEquals(Main.launcherCommandForSelection(2), Some("chat"))
+    assertEquals(Main.launcherCommandForSelection(3), Some("benchmark"))
+    assertEquals(Main.launcherCommandForSelection(4), Some("chunk"))
+    assertEquals(Main.launcherCommandForSelection(5), Some("gpu-info"))
+    assertEquals(Main.launcherCommandForSelection(6), Some("help"))
+    assertEquals(Main.launcherCommandForSelection(7), Some("exit"))
+    assertEquals(Main.launcherCommandForSelection(8), None)
   }
 
   test("resolveLauncherCommand accepts defaults and valid choices") {
     assertEquals(Main.resolveLauncherCommand(""), Some("train"))
     assertEquals(Main.resolveLauncherCommand("1"), Some("train"))
     assertEquals(Main.resolveLauncherCommand("2"), Some("predict"))
-    assertEquals(Main.resolveLauncherCommand("3"), Some("benchmark"))
-    assertEquals(Main.resolveLauncherCommand("7"), Some("exit"))
-    assertEquals(Main.resolveLauncherCommand("8"), None)
+    assertEquals(Main.resolveLauncherCommand("3"), Some("chat"))
+    assertEquals(Main.resolveLauncherCommand("4"), Some("benchmark"))
+    assertEquals(Main.resolveLauncherCommand("8"), Some("exit"))
+    assertEquals(Main.resolveLauncherCommand("9"), None)
   }
 
   test("shouldCleanupInterruptArtifactsOnCanceledStart only cleans canceled auto-resume runs") {

@@ -2,10 +2,10 @@
 
 A from-scratch neural next-word predictor in Scala 3.
 
-This project trains a small language model on plain text and predicts likely next words for a given context. It includes:
+This project trains a small language model on plain text and supports next-word prediction and multi-turn chat generation. It includes:
 
 - Pure Scala math/model code (no ML frameworks)
-- CLI workflow for train, predict, chunk, gpu-info, and benchmark
+- CLI workflow for train, predict, chat, chunk, gpu-info, and benchmark
 - CPU backend + optional Apple Metal GPU backend via JNI
 - Batched training path with progress, early stopping, checkpoints
 
@@ -74,7 +74,13 @@ sbt "run train --inputs data/corpus/a.txt,data/corpus/b.txt --inputWeights 0.7,0
 sbt 'run predict --context "the company" --topK 5'
 ```
 
-### 5) Benchmark (runs full matrix by default)
+### 5) Chat (multi-turn generation)
+
+```bash
+sbt 'run chat --maxTokens 32 --temperature 0.8 --topP 0.9 --topK 40 --banUnk true'
+```
+
+### 6) Benchmark (runs full matrix by default)
 
 ```bash
 sbt "run benchmark --input data/corpus/example-corpus.txt --sample 2000"
@@ -87,7 +93,7 @@ By default benchmark runs:
 - GPU fp64
 - GPU fp32
 
-### 6) Run tests
+### 7) Run tests
 
 ```bash
 sbt test
@@ -184,13 +190,40 @@ Options:
 
 - `--context TEXT`
 - `--topK N`
+- `--debug BOOL` (default: `false`; when `true`, `<UNK>` is shown in top predictions)
 - `--backend cpu|gpu` (default `gpu`)
 - `--precision fp64|fp32` (default `fp64`)
 
 Notes:
 
 - Without `--context`, prediction stays in an interactive loop until `quit`/`exit`.
-- High `<UNK>` confidence triggers a hint to use longer in-domain context or larger vocab.
+- In interactive launcher/no-flag mode, `predict` asks whether to enable debug mode.
+- With debug mode off, `<UNK>` is suppressed from displayed top predictions.
+- `predict` is best for top-K inspection/debugging; use `chat` for multi-turn generation.
+
+### `chat`
+
+```bash
+sbt 'run chat --maxTokens 32 --temperature 0.8 --topP 0.9 --topK 40 --banUnk true'
+```
+
+Options:
+
+- `--maxTokens N` (default: `32`)
+- `--temperature V` in `[0.1, 2.0]` (default: `0.8`)
+- `--topP V` in `[0.1, 1.0]` (default: `0.9`)
+- `--topK N` in `[1, 200]` (default: `40`)
+- `--banUnk BOOL` (default: `true`)
+- `--stopToken TEXT` (optional stop token)
+- `--backend cpu|gpu` (default `gpu`)
+- `--precision fp64|fp32` (default `fp64`)
+
+Notes:
+
+- Chat keeps turn history in memory for the current process only.
+- Output streams token-by-token and stops at `maxTokens` or `stopToken`.
+- By default, chat suppresses `<UNK>` when other candidate tokens are available.
+- Invalid/out-of-range decoding flags fall back to defaults with a warning.
 
 ### `chunk`
 

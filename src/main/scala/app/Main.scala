@@ -15,6 +15,7 @@ import java.util.Properties
 import java.util.Locale
 import scala.io.StdIn
 import scala.jdk.CollectionConverters._
+import scala.util.Random
 import scala.util.Using
 import scala.util.control.NoStackTrace
 
@@ -24,7 +25,14 @@ object Main:
   private val BenchmarkPreferenceOrder: Vector[(String, String)] =
     Vector(("gpu", "fp32"), ("gpu", "fp64"), ("cpu", "fp32"), ("cpu", "fp64"))
   private val LauncherCommands: Vector[String] =
-    Vector("train", "predict", "benchmark", "chunk", "gpu-info", "help", "exit")
+    Vector("train", "predict", "chat", "benchmark", "chunk", "gpu-info", "help", "exit")
+  private val DefaultChatMaxTokens = 32
+  private val DefaultChatTemperature = 0.8
+  private val DefaultChatTopP = 0.9
+  private val DefaultChatTopK = 40
+  private val ChatHistoryLimitMultiplier = 64
+  private val ChatHistoryLimitMin = 512
+  private val ChatHistoryLimitMax = 4096
 
   private def displayPath(path: Path): String =
     val normalized = path.toAbsolutePath.normalize
@@ -67,6 +75,10 @@ object Main:
   private def isBackToken(raw: String): Boolean =
     val t = raw.trim.toLowerCase
     t == "b" || t == "back"
+
+  private[app] def isExitCommand(raw: String): Boolean =
+    val t = raw.trim
+    t.equalsIgnoreCase("quit") || t.equalsIgnoreCase("exit")
 
   private enum MenuPick:
     case Choice(index: Int)
@@ -288,6 +300,7 @@ object Main:
         try runTrain(CliHelpers.parseArgs(args.drop(1)))
         catch case BackToLauncher => println("Canceled and returned.")
       case "predict" => runPredict(CliHelpers.parseArgs(args.drop(1)))
+      case "chat" => runChat(CliHelpers.parseArgs(args.drop(1)))
       case "chunk"   => runChunker(CliHelpers.parseArgs(args.drop(1)))
       case "gpu-info" => runGpuInfo(CliHelpers.parseArgs(args.drop(1)))
       case "benchmark" =>
@@ -315,11 +328,12 @@ object Main:
         println("What would you like to do?")
         println("  1. Train model (guided)")
         println("  2. Predict next words")
-        println("  3. Run benchmark")
-        println("  4. Chunk text files")
-        println("  5. Check GPU info")
-        println("  6. Help / command reference")
-        println("  7. Exit")
+        println("  3. Chat (multi-turn)")
+        println("  4. Run benchmark")
+        println("  5. Chunk text files")
+        println("  6. Check GPU info")
+        println("  7. Help / command reference")
+        println("  8. Exit")
         println()
         Option(readLineWithPrompt("Select [1]: ")) match
           case None =>
@@ -340,22 +354,26 @@ object Main:
         case Some("predict") =>
           try runPredict(Map.empty)
           catch case BackToLauncher => println("Returning to main menu.")
-          println("Quick actions: 1) Train  2) Predict  3) Benchmark  7) Exit")
+          println("Quick actions: 1) Train  2) Predict  3) Chat  4) Benchmark  8) Exit")
+        case Some("chat") =>
+          try runChat(Map.empty)
+          catch case BackToLauncher => println("Returning to main menu.")
+          println("Quick actions: 1) Train  2) Predict  3) Chat  4) Benchmark  8) Exit")
         case Some("benchmark") =>
           try runBenchmark(Map.empty)
           catch case BackToLauncher => println("Returning to main menu.")
-          println("Quick actions: 1) Train  2) Predict  3) Benchmark  7) Exit")
+          println("Quick actions: 1) Train  2) Predict  3) Chat  4) Benchmark  8) Exit")
         case Some("chunk") =>
           try runChunker(Map.empty)
           catch case BackToLauncher => println("Returning to main menu.")
-          println("Quick actions: 1) Train  2) Predict  3) Benchmark  7) Exit")
+          println("Quick actions: 1) Train  2) Predict  3) Chat  4) Benchmark  8) Exit")
         case Some("gpu-info") =>
           try runGpuInfo(Map.empty)
           catch case BackToLauncher => println("Returning to main menu.")
-          println("Quick actions: 1) Train  2) Predict  3) Benchmark  7) Exit")
+          println("Quick actions: 1) Train  2) Predict  3) Chat  4) Benchmark  8) Exit")
         case Some("help") =>
           printUsage()
-          println("Quick actions: 1) Train  2) Predict  3) Benchmark  7) Exit")
+          println("Quick actions: 1) Train  2) Predict  3) Chat  4) Benchmark  8) Exit")
         case Some("exit")      =>
           println("Exiting.")
           keepRunning = false
@@ -937,6 +955,7 @@ object Main:
     println()
     println("Continue with: sbt \"run train --inputs <more1.txt,more2.txt>\"")
     println("Or predict:    sbt 'run predict --context \"your text\"'")
+    println("Or chat:       sbt 'run chat --maxTokens 32 --temperature 0.8 --topP 0.9 --topK 40 --banUnk true'")
 
   private def selectTrainingInputInteractively(): Path =
     val candidates = discoverTextFiles(Path.of(".").toAbsolutePath.normalize, maxDepth = 6)
@@ -1185,12 +1204,24 @@ object Main:
     println(s"Model: ${vocab.size} words, context=${cfg.contextSize}")
     println()
 
+    val debugMode =
+      flags.get("debug") match
+        case Some(raw) => CliHelpers.parseYesNo(raw, default = false)
+        case None =>
+          if flags.isEmpty then promptYesNo("Enable debug mode (show <UNK> in top predictions)?", false)
+          else false
+    println(s"Prediction debug mode: ${if debugMode then "on" else "off"}")
+    println()
+
     val topK = CliHelpers.boundedTopK(flags.get("topK").flatMap(_.toIntOption).getOrElse(5))
     def predictOnce(contextText: String): Unit =
       val tokens = TextPipeline.tokenize(contextText)
       val contextIds = adaptContext(tokens.map(vocab.toId), cfg.contextSize, vocab.unkId)
       val cache = LanguageModel.forward(params, contextIds, cfg.activation, backend)
-      val top = LinearAlgebra.argTopK(cache.probs, topK)
+      val top = predictionTopForDisplay(cache.probs, topK, vocab.unkId, debugMode)
+      val unkProb =
+        if vocab.unkId >= 0 && vocab.unkId < cache.probs.length then cache.probs(vocab.unkId)
+        else 0.0
 
       println("\nTop predictions:")
       top.zipWithIndex.foreach { case ((id, prob), idx) =>
@@ -1199,10 +1230,14 @@ object Main:
         println(f"  ${idx + 1}. $word%-12s $bar%-20s ${prob * 100}%.1f%%")
       }
 
-      top.headOption.foreach { case (id, prob) =>
-        if id == vocab.unkId && prob >= 0.2 then
-          println("  Tip: high <UNK> confidence. Try longer context, in-domain words, or retrain with larger --maxVocab.")
-      }
+      if debugMode then
+        LinearAlgebra.argTopK(cache.probs, 1).headOption.foreach { case (id, prob) =>
+          println(f"  Debug: raw top=${vocab.toToken(id)} (${prob * 100}%.1f%%), <UNK>=${unkProb * 100}%.1f%%")
+          if id == vocab.unkId && prob >= 0.2 then
+            println("  Tip: high <UNK> confidence. Try longer context, in-domain words, or retrain with larger --maxVocab.")
+        }
+      else if unkProb > 0.0 then
+        println(f"  Debug: <UNK> suppressed from ranking (${unkProb * 100}%.1f%%). Use --debug true to show raw ranking.")
 
     flags.get("context") match
       case Some(text) =>
@@ -1216,10 +1251,204 @@ object Main:
             keepRunning = false
           else
             val normalized = raw.trim
-            if normalized.equalsIgnoreCase("quit") || normalized.equalsIgnoreCase("exit") then
+            if isExitCommand(normalized) then
               keepRunning = false
             else if normalized.nonEmpty then
               predictOnce(normalized)
+
+  private[app] def predictionTopForDisplay(probs: Vector[Double], topK: Int, unkId: Int, debugMode: Boolean): Vector[(Int, Double)] =
+    val ranked = probs.zipWithIndex.sortBy { case (p, _) => -p }
+    val filtered =
+      if debugMode then ranked
+      else ranked.filter { case (_, idx) => idx != unkId }
+    val chosen = if filtered.nonEmpty then filtered else ranked.take(1)
+    chosen.take(math.max(1, topK)).map { case (prob, idx) => (idx, prob) }
+
+  private case class ChatDecodingConfig(
+      maxTokens: Int,
+      temperature: Double,
+      topP: Double,
+      topK: Int,
+      banUnk: Boolean,
+      historyLimit: Int,
+      stopTokenId: Option[Int]
+  )
+
+  private[app] def chatDecodeCandidates(probs: Vector[Double], temperature: Double, topP: Double, topK: Int): Vector[(Int, Double)] =
+    if probs.isEmpty then Vector.empty
+    else
+      val safe = probs.map(p => if p.isNaN || p < 0.0 then 0.0 else p)
+      val fallbackIdx = safe.zipWithIndex.maxByOption(_._1).map(_._2).getOrElse(0)
+      val invTemp = 1.0 / temperature
+      val tempered = safe.map(p => if p <= 0.0 then 0.0 else math.pow(p, invTemp))
+
+      val sorted = tempered.zipWithIndex.collect { case (p, idx) if p > 0.0 => (idx, p) }.sortBy { case (_, p) => -p }
+      val topKLimited = sorted.take(math.max(1, topK))
+      val topKSum = topKLimited.map(_._2).sum
+      val normalizedTopK =
+        if topKSum <= 0.0 then Vector((fallbackIdx, 1.0))
+        else topKLimited.map { case (idx, p) => (idx, p / topKSum) }
+
+      val topPLimited =
+        if topP >= 1.0 then normalizedTopK
+        else
+          val acc = scala.collection.mutable.ArrayBuffer.empty[(Int, Double)]
+          var cumulative = 0.0
+          normalizedTopK.foreach { case entry @ (_, p) =>
+            if cumulative < topP || acc.isEmpty then
+              acc += entry
+              cumulative += p
+          }
+          acc.toVector
+
+      val finalSum = topPLimited.map(_._2).sum
+      if finalSum <= 0.0 then Vector((fallbackIdx, 1.0))
+      else topPLimited.map { case (idx, p) => (idx, p / finalSum) }
+
+  private[app] def chatSampleToken(candidates: Vector[(Int, Double)], rnd: Random): Int =
+    if candidates.isEmpty then 0
+    else
+      val draw = rnd.nextDouble()
+      var cumulative = 0.0
+      var sampled = candidates.last._1
+      var i = 0
+      while i < candidates.length do
+        val (id, p) = candidates(i)
+        cumulative += p
+        if draw <= cumulative then
+          sampled = id
+          i = candidates.length
+        else i += 1
+      sampled
+
+  private[app] def suppressUnkProbability(probs: Vector[Double], unkId: Int, banUnk: Boolean): Vector[Double] =
+    if !banUnk || unkId < 0 || unkId >= probs.length then probs
+    else
+      val nonUnkMass = probs.zipWithIndex.collect { case (p, idx) if idx != unkId => p }.sum
+      if nonUnkMass > 0.0 then probs.updated(unkId, 0.0) else probs
+
+  private def chatConfigFromFlags(flags: Map[String, String], contextSize: Int, vocab: data.Vocab): ChatDecodingConfig =
+    val maxTokensParsed = CliHelpers.boundedIntOrDefault(flags.get("maxTokens"), default = DefaultChatMaxTokens, min = 1, max = 256)
+    if maxTokensParsed.invalidInput then
+      println(s"[chat] Invalid --maxTokens='${flags.getOrElse("maxTokens", "")}'. Using default $DefaultChatMaxTokens.")
+
+    val temperatureParsed =
+      CliHelpers.boundedDoubleOrDefault(flags.get("temperature"), default = DefaultChatTemperature, minInclusive = 0.1, maxInclusive = 2.0)
+    if temperatureParsed.invalidInput then
+      println(s"[chat] Invalid --temperature='${flags.getOrElse("temperature", "")}'. Using default $DefaultChatTemperature.")
+
+    val topPParsed = CliHelpers.boundedDoubleOrDefault(flags.get("topP"), default = DefaultChatTopP, minInclusive = 0.1, maxInclusive = 1.0)
+    if topPParsed.invalidInput then
+      println(s"[chat] Invalid --topP='${flags.getOrElse("topP", "")}'. Using default $DefaultChatTopP.")
+
+    val topKParsed = CliHelpers.boundedIntOrDefault(flags.get("topK"), default = DefaultChatTopK, min = 1, max = 200)
+    if topKParsed.invalidInput then
+      println(s"[chat] Invalid --topK='${flags.getOrElse("topK", "")}'. Using default $DefaultChatTopK.")
+
+    val banUnk = CliHelpers.parseYesNo(flags.getOrElse("banUnk", "true"), default = true)
+
+    val stopTokenId = flags
+      .get("stopToken")
+      .map(_.trim)
+      .filter(_.nonEmpty)
+      .flatMap(raw => TextPipeline.tokenize(raw).headOption)
+      .map(vocab.toId)
+
+    val historyLimit = math.max(ChatHistoryLimitMin, math.min(ChatHistoryLimitMax, contextSize * ChatHistoryLimitMultiplier))
+    ChatDecodingConfig(
+      maxTokens = maxTokensParsed.value,
+      temperature = temperatureParsed.value,
+      topP = topPParsed.value,
+      topK = topKParsed.value,
+      banUnk = banUnk,
+      historyLimit = historyLimit,
+      stopTokenId = stopTokenId
+    )
+
+  private def appendWithLimit(history: Vector[Int], next: Vector[Int], limit: Int): Vector[Int] =
+    if next.isEmpty then history
+    else
+      val merged = history ++ next
+      if merged.length <= limit then merged else merged.takeRight(limit)
+
+  private def generateChatReply(
+      history: Vector[Int],
+      cfg: ModelConfig,
+      params: nn.Params,
+      vocab: data.Vocab,
+      backend: compute.ComputeBackend,
+      decoding: ChatDecodingConfig,
+      rnd: Random
+  ): (Vector[Int], Int) =
+    var rollingHistory = history
+    val generated = scala.collection.mutable.ArrayBuffer.empty[Int]
+    var unkCount = 0
+    var step = 0
+    while step < decoding.maxTokens do
+      val contextIds = adaptContext(rollingHistory, cfg.contextSize, vocab.unkId)
+      val cache = LanguageModel.forward(params, contextIds, cfg.activation, backend)
+      val adjustedProbs = suppressUnkProbability(cache.probs, vocab.unkId, decoding.banUnk)
+      val candidates = chatDecodeCandidates(adjustedProbs, decoding.temperature, decoding.topP, decoding.topK)
+      val nextId = chatSampleToken(candidates, rnd)
+      generated += nextId
+      if nextId == vocab.unkId then unkCount += 1
+      rollingHistory = appendWithLimit(rollingHistory, Vector(nextId), decoding.historyLimit)
+      step += 1
+      if decoding.stopTokenId.contains(nextId) then step = decoding.maxTokens
+    (generated.toVector, unkCount)
+
+  private def runChat(flags: Map[String, String]): Unit =
+    println("\n=== Chat ===\n")
+
+    if !Files.isRegularFile(ModelPath) then
+      println("No model found. Train first:")
+      println("  sbt \"run train --input data/corpus/text.txt\"")
+      sys.exit(1)
+
+    val (params, cfg) = CheckpointIO.load(ModelPath)
+    val vocab = VocabIO.load(VocabPath)
+    val backendName = flags.getOrElse("backend", "gpu")
+    val backend = BackendSelector.fromConfig(
+      backendName,
+      flags.getOrElse("precision", defaultPrecisionForBackend(backendName)),
+      warn = msg => println(s"[backend] $msg")
+    )
+    val decoding = chatConfigFromFlags(flags, cfg.contextSize, vocab)
+    val rnd = Random()
+
+    println(s"Model: ${vocab.size} words, context=${cfg.contextSize}")
+    println(
+      s"Chat settings: maxTokens=${decoding.maxTokens} temperature=${formatDecimal(decoding.temperature, 2)} topP=${formatDecimal(decoding.topP, 2)} topK=${decoding.topK} banUnk=${decoding.banUnk}"
+    )
+    println("Enter a message (or 'quit').")
+
+    var history = Vector.empty[Int]
+    var keepRunning = true
+    while keepRunning do
+      val raw = StdIn.readLine("you> ")
+      if raw == null then
+        keepRunning = false
+      else
+        val normalized = raw.trim
+        if isExitCommand(normalized) then
+          keepRunning = false
+        else if normalized.nonEmpty then
+          val userTokens = TextPipeline.tokenize(normalized).map(vocab.toId)
+          history = appendWithLimit(history, userTokens, decoding.historyLimit)
+          print("bot> ")
+          Console.out.flush()
+          val (replyIds, unkCount) = generateChatReply(history, cfg, params, vocab, backend, decoding, rnd)
+          val replyTokens = replyIds.map(vocab.toToken)
+          replyTokens.zipWithIndex.foreach { case (tok, idx) =>
+            if idx > 0 then print(" ")
+            print(tok)
+            Console.out.flush()
+          }
+          println()
+          if replyIds.nonEmpty && unkCount * 2 >= replyIds.length then
+            println("  Tip: this reply used many <UNK> tokens. Try in-domain prompts or retrain with larger --maxVocab.")
+          println()
+          history = appendWithLimit(history, replyIds, decoding.historyLimit)
 
   private def runGpuInfo(flags: Map[String, String]): Unit =
     val backendName = BackendSelector.normalizeBackend(flags.getOrElse("backend", "gpu"))
@@ -1586,6 +1815,7 @@ object Main:
         |  sbt "run"              Show this menu
         |  sbt "run train"        Train/continue training
         |  sbt "run predict"      Predict next words
+        |  sbt "run chat"         Multi-turn chat generation
         |  sbt "run chunk"        Split large files into chunks
         |  sbt "run gpu-info"     Show Metal/JNI status
         |  sbt "run benchmark"    Interactive benchmark setup + throughput estimate
@@ -1621,6 +1851,17 @@ object Main:
         |Prediction:
         |  --context TEXT    Words to continue from
         |  --topK N          Predictions to show (default: 5)
+        |  --debug BOOL      Show debug details and allow <UNK> in rankings (default: false)
+        |  --backend NAME    cpu|gpu (default: gpu)
+        |  --precision MODE  fp64|fp32 (default: fp64)
+        |
+        |Chat:
+        |  --maxTokens N     Max generated tokens per turn (default: 32)
+        |  --temperature V   Sampling temperature in [0.1, 2.0] (default: 0.8)
+        |  --topP V          Nucleus sampling threshold in [0.1, 1.0] (default: 0.9)
+        |  --topK N          Candidate cutoff in [1, 200] (default: 40)
+        |  --banUnk BOOL     Suppress <UNK> token when alternatives exist (default: true)
+        |  --stopToken TEXT  Optional stop token (single token after normalization)
         |  --backend NAME    cpu|gpu (default: gpu)
         |  --precision MODE  fp64|fp32 (default: fp64)
 
@@ -1646,4 +1887,5 @@ object Main:
         |  sbt "run train --inputs data/a.txt,data/b.txt --inputWeights 0.7,0.3 --replayRatio 0.3 --replayBufferSize 10000"
         |  sbt "run chunk --input large-file.txt --lines 1000"
         |  sbt 'run predict --context "the cat sat" --topK 5'
+        |  sbt 'run chat --maxTokens 32 --temperature 0.8 --topP 0.9 --topK 40 --banUnk true'
 |""".stripMargin)

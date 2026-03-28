@@ -3,6 +3,8 @@ package app
 import java.nio.file.Path
 
 object CliHelpers:
+  final case class ParsedValue[A](value: A, invalidInput: Boolean)
+
   def trimOrEmpty(raw: String): String =
     Option(raw).getOrElse("").trim
 
@@ -78,3 +80,21 @@ object CliHelpers:
   def boundedTopK(requested: Int, default: Int = 5, min: Int = 1, max: Int = 50): Int =
     val base = if requested <= 0 then default else requested
     math.max(min, math.min(max, base))
+
+  def boundedIntOrDefault(raw: Option[String], default: Int, min: Int, max: Int): ParsedValue[Int] =
+    require(min <= max, s"min must be <= max, got min=$min max=$max")
+    raw match
+      case None => ParsedValue(default, invalidInput = false)
+      case Some(text) =>
+        text.trim.toIntOption match
+          case Some(v) if v >= min && v <= max => ParsedValue(v, invalidInput = false)
+          case _                                => ParsedValue(default, invalidInput = true)
+
+  def boundedDoubleOrDefault(raw: Option[String], default: Double, minInclusive: Double, maxInclusive: Double): ParsedValue[Double] =
+    require(minInclusive <= maxInclusive, s"minInclusive must be <= maxInclusive, got min=$minInclusive max=$maxInclusive")
+    raw match
+      case None => ParsedValue(default, invalidInput = false)
+      case Some(text) =>
+        text.trim.toDoubleOption match
+          case Some(v) if v >= minInclusive && v <= maxInclusive => ParsedValue(v, invalidInput = false)
+          case _                                                  => ParsedValue(default, invalidInput = true)
