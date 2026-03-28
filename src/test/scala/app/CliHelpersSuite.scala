@@ -122,3 +122,35 @@ class CliHelpersSuite extends FunSuite:
     assertEquals(CliHelpers.boundedTopK(3), 3)
     assertEquals(CliHelpers.boundedTopK(999), 50)
   }
+
+  test("boundedIntOrDefault uses provided value when valid") {
+    val got = CliHelpers.boundedIntOrDefault(Some("32"), default = 16, min = 1, max = 64)
+    assertEquals(got.value, 32)
+    assertEquals(got.invalidInput, false)
+  }
+
+  test("boundedIntOrDefault falls back for invalid and out-of-range") {
+    val invalid = CliHelpers.boundedIntOrDefault(Some("abc"), default = 16, min = 1, max = 64)
+    assertEquals(invalid.value, 16)
+    assertEquals(invalid.invalidInput, true)
+
+    val outOfRange = CliHelpers.boundedIntOrDefault(Some("999"), default = 16, min = 1, max = 64)
+    assertEquals(outOfRange.value, 16)
+    assertEquals(outOfRange.invalidInput, true)
+  }
+
+  test("boundedDoubleOrDefault uses provided value when valid") {
+    val got = CliHelpers.boundedDoubleOrDefault(Some("0.8"), default = 0.5, minInclusive = 0.1, maxInclusive = 1.0)
+    assertEqualsDouble(got.value, 0.8, 1e-12)
+    assertEquals(got.invalidInput, false)
+  }
+
+  test("boundedDoubleOrDefault falls back for invalid and out-of-range") {
+    val invalid = CliHelpers.boundedDoubleOrDefault(Some("nope"), default = 0.5, minInclusive = 0.1, maxInclusive = 1.0)
+    assertEqualsDouble(invalid.value, 0.5, 1e-12)
+    assertEquals(invalid.invalidInput, true)
+
+    val outOfRange = CliHelpers.boundedDoubleOrDefault(Some("2.0"), default = 0.5, minInclusive = 0.1, maxInclusive = 1.0)
+    assertEqualsDouble(outOfRange.value, 0.5, 1e-12)
+    assertEquals(outOfRange.invalidInput, true)
+  }
