@@ -25,7 +25,7 @@ object Main:
   private val BenchmarkPreferenceOrder: Vector[(String, String)] =
     Vector(("gpu", "fp32"), ("gpu", "fp64"), ("cpu", "fp32"), ("cpu", "fp64"))
   private val LauncherCommands: Vector[String] =
-    Vector("train", "predict", "chat", "benchmark", "chunk", "gpu-info", "help", "exit")
+    Vector("train", "predict", "chat", "benchmark", "chunk", "gpu-info", "metal-build", "help", "exit")
   private val DefaultChatMaxTokens = 32
   private val DefaultChatTemperature = 0.8
   private val DefaultChatTopP = 0.9
@@ -303,6 +303,7 @@ object Main:
       case "chat" => runChat(CliHelpers.parseArgs(args.drop(1)))
       case "chunk"   => runChunker(CliHelpers.parseArgs(args.drop(1)))
       case "gpu-info" => runGpuInfo(CliHelpers.parseArgs(args.drop(1)))
+      case "metal-build" => runMetalBuild()
       case "benchmark" =>
         try runBenchmark(CliHelpers.parseArgs(args.drop(1)))
         catch case BackToLauncher => println("Canceled and returned.")
@@ -332,8 +333,9 @@ object Main:
         println("  4. Run benchmark")
         println("  5. Chunk text files")
         println("  6. Check GPU info")
-        println("  7. Help / command reference")
-        println("  8. Exit")
+        println("  7. Build Metal JNI (enable GPU)")
+        println("  8. Help / command reference")
+        println("  9. Exit")
         println()
         Option(readLineWithPrompt("Select [1]: ")) match
           case None =>
@@ -369,6 +371,10 @@ object Main:
           println("Quick actions: 1) Train  2) Predict  3) Chat  4) Benchmark  8) Exit")
         case Some("gpu-info") =>
           try runGpuInfo(Map.empty)
+          catch case BackToLauncher => println("Returning to main menu.")
+          println("Quick actions: 1) Train  2) Predict  3) Chat  4) Benchmark  8) Exit")
+        case Some("metal-build") =>
+          try runMetalBuild()
           catch case BackToLauncher => println("Returning to main menu.")
           println("Quick actions: 1) Train  2) Predict  3) Chat  4) Benchmark  8) Exit")
         case Some("help") =>
@@ -500,7 +506,33 @@ object Main:
     if !effectiveFlags.contains("preset") then println(s"Selected preset: ${preset.name.capitalize}")
 
     val autoConfirm = flags.get("yes").exists(CliHelpers.isTruthy)
-    val backend = BackendSelector.normalizeBackend(effectiveFlags.getOrElse("backend", "gpu"))
+    var backend = BackendSelector.normalizeBackend(effectiveFlags.getOrElse("backend", "gpu"))
+    if backend == "gpu" && !autoConfirm then
+      val probe = compute.MetalNativeBridge.probe()
+      if !probe.available && probe.error.exists(_.contains("metal_jni")) then
+        println("\nGPU (Metal) requested, but the native JNI library is missing.")
+        println("Would you like to build it now to enable GPU acceleration?")
+        println("  1. Build Metal JNI library and use GPU (recommended)")
+        println("  2. Proceed with CPU fallback for this run")
+        println("  b. Back to main menu")
+        var metalResolved = false
+        while !metalResolved do
+          val raw = readTrimmedRequired("Select [1]: ", "select metal action")
+          parseMenuPick(raw, optionCount = 2, defaultIndex = 0, allowBack = true) match
+            case Some(MenuPick.Choice(0)) =>
+              runMetalBuild()
+              metalResolved = true
+            case Some(MenuPick.Choice(1)) =>
+              println("Proceeding with CPU fallback.")
+              backend = "cpu"
+              metalResolved = true
+            case Some(MenuPick.Choice(_)) => // Fallback for any other index
+              runMetalBuild()
+              metalResolved = true
+            case Some(MenuPick.Back) =>
+              throw BackToLauncher
+            case None =>
+              println("Please choose 1 or 2, or type 'b' to go back.")
     val precision = effectiveFlags.get("precision") match
       case Some(raw) => BackendSelector.normalizePrecision(raw)
       case None =>
@@ -1454,6 +1486,28 @@ object Main:
     val precision = BackendSelector.normalizePrecision(flags.getOrElse("precision", defaultPrecisionForBackend(backendName)))
     println(s"\nGPU probe ($precision): ${BackendSelector.gpuInfo(precision)}")
 
+  private def runMetalBuild(): Unit =
+    println("\n=== Metal JNI Build ===\n")
+    val script = ProjectRoot.resolve("metal-jni/scripts/build-metal-jni.sh")
+    if !Files.exists(script) then
+      println(s"Error: Build script not found at ${displayPath(script)}")
+      return
+
+    println(s"Running build script: ${displayPath(script)}")
+    import scala.sys.process._
+    try
+      val exitCode = Process(Seq("bash", script.toAbsolutePath.toString), ProjectRoot.toFile).!
+      if exitCode == 0 then
+        println("\n✓ Metal JNI library built successfully.")
+        println("GPU acceleration should now be available.")
+        // Refresh probe after build
+        compute.MetalNativeBridge.probe()
+      else
+        println(s"\n✗ Build failed with exit code $exitCode")
+    catch
+      case t: Throwable =>
+        println(s"\n✗ Error executing build script: ${t.getMessage}")
+
   private def runBenchmark(flags: Map[String, String]): Unit =
     println("\n=== Benchmark ===")
     val effectiveFlags =
@@ -1826,6 +1880,7 @@ object Main:
         |  sbt "run chat"         Multi-turn chat generation
         |  sbt "run chunk"        Split large files into chunks
         |  sbt "run gpu-info"     Show Metal/JNI status
+        |  sbt "run metal-build"  Build native Metal library (enable GPU)
         |  sbt "run benchmark"    Interactive benchmark setup + throughput estimate
         |
         |Training:
