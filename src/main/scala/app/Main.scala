@@ -958,8 +958,7 @@ object Main:
     println("Or chat:       sbt 'run chat --maxTokens 32 --temperature 0.8 --topP 0.9 --topK 40 --banUnk true'")
 
   private def selectTrainingInputInteractively(): Path =
-    val candidates = discoverTextFiles(Path.of(".").toAbsolutePath.normalize, maxDepth = 6)
-      .filter(p => !p.toString.contains("/chunks/"))
+    val candidates = discoverTextFiles(ProjectRoot, maxDepth = 6)
     val candidatesWithLines = candidates.map { p =>
       val lines = countLines(p)
       val size = Files.size(p) / 1024
@@ -971,7 +970,7 @@ object Main:
     val (recommended, other) = CliHelpers.classifyTrainingFiles(candidatesWithLines.map(_._1))
     val orderedPaths = recommended ++ other
     val byPath = candidatesWithLines.map { case (p, lines, size) => p -> (lines, size) }.toMap
-    println("Found text files you can train on (chunk files excluded):")
+    println("Found text files you can train on:")
     println("Tip: press Enter to choose the default [1]. Type 'b' to go back.\n")
     if recommended.nonEmpty then println("  Recommended training files:")
     recommended.zipWithIndex.foreach { case (p, idx) =>
@@ -979,7 +978,7 @@ object Main:
       val linesStr = if lines > 0 then s"$lines lines" else "unknown lines"
       println(s"    ${idx + 1}. ${displayPath(p)} ($linesStr, ${size} KB)")
     }
-    if other.nonEmpty then println("  Other text files (likely derived; usually avoid):")
+    if other.nonEmpty then println("  Other text files (derived or chunks; usually avoid):")
     other.zipWithIndex.foreach { case (p, idx) =>
       val (lines, size) = byPath(p)
       val linesStr = if lines > 0 then s"$lines lines" else "unknown lines"
@@ -1082,7 +1081,7 @@ object Main:
       case Some(path) => Path.of(path)
       case None =>
         // Discover text files
-        val candidates = discoverTextFiles(Path.of(".").toAbsolutePath.normalize, maxDepth = 6)
+        val candidates = discoverTextFiles(ProjectRoot, maxDepth = 6)
         if candidates.isEmpty then
           println("No .txt files found. Specify --input <file.txt>")
           sys.exit(1)
@@ -1788,17 +1787,26 @@ object Main:
         catch
           case _: Exception => 0
 
-  private def discoverTextFiles(root: Path, maxDepth: Int = 6, maxResults: Int = 20): Vector[Path] =
+  private def discoverTextFiles(root: Path, maxDepth: Int = 6, maxResults: Int = 40): Vector[Path] =
     if !Files.exists(root) then Vector.empty
     else
-      Using.resource(Files.walk(root, maxDepth)) { stream =>
-        stream.iterator().asScala
-          .filter(Files.isRegularFile(_))
-          .filter(p => p.getFileName.toString.toLowerCase.endsWith(".txt"))
-          .toVector
-          .sortBy(_.toString)
-          .take(maxResults)
-      }
+      try
+        Using.resource(Files.walk(root, maxDepth)) { stream =>
+          val all = stream.iterator().asScala
+            .filter(Files.isRegularFile(_))
+            .filter(p => p.getFileName.toString.toLowerCase.endsWith(".txt"))
+            .filterNot { p =>
+              val s = p.toString
+              s.contains("/.git/") || s.contains("/target/") || s.contains("/.bsp/") || s.contains("/.metal/")
+            }
+            .toVector
+            .sortBy(_.toString)
+          
+          val (chunks, others) = all.partition(p => p.toString.contains("/chunks/") || p.getFileName.toString.toLowerCase.contains("part"))
+          (others ++ chunks).take(maxResults)
+        }
+      catch
+        case _: Exception => Vector.empty
 
   private def promptYesNo(label: String, default: Boolean): Boolean =
     val defaultStr = if default then "Y/n" else "y/N"
