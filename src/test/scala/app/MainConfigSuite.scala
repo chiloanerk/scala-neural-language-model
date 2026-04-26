@@ -78,9 +78,10 @@ class MainConfigSuite extends FunSuite:
     assertEquals(Main.launcherCommandForSelection(3), Some("benchmark"))
     assertEquals(Main.launcherCommandForSelection(4), Some("chunk"))
     assertEquals(Main.launcherCommandForSelection(5), Some("gpu-info"))
-    assertEquals(Main.launcherCommandForSelection(6), Some("help"))
-    assertEquals(Main.launcherCommandForSelection(7), Some("exit"))
-    assertEquals(Main.launcherCommandForSelection(8), None)
+    assertEquals(Main.launcherCommandForSelection(6), Some("metal-build"))
+    assertEquals(Main.launcherCommandForSelection(7), Some("help"))
+    assertEquals(Main.launcherCommandForSelection(8), Some("exit"))
+    assertEquals(Main.launcherCommandForSelection(9), None)
   }
 
   test("resolveLauncherCommand accepts defaults and valid choices") {
@@ -89,8 +90,9 @@ class MainConfigSuite extends FunSuite:
     assertEquals(Main.resolveLauncherCommand("2"), Some("predict"))
     assertEquals(Main.resolveLauncherCommand("3"), Some("chat"))
     assertEquals(Main.resolveLauncherCommand("4"), Some("benchmark"))
-    assertEquals(Main.resolveLauncherCommand("8"), Some("exit"))
-    assertEquals(Main.resolveLauncherCommand("9"), None)
+    assertEquals(Main.resolveLauncherCommand("7"), Some("metal-build"))
+    assertEquals(Main.resolveLauncherCommand("9"), Some("exit"))
+    assertEquals(Main.resolveLauncherCommand("10"), None)
   }
 
   test("shouldCleanupInterruptArtifactsOnCanceledStart only cleans canceled auto-resume runs") {
