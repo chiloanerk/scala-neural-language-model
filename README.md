@@ -368,6 +368,13 @@ metal-jni/
   ...         # Metal bridge (optional)
 ```
 
+## Book
+
+*Build Your Own Language Model in Scala — From Zero to a Working Neural Network, No Experience Required* is a companion book that walks through building this project from scratch, chapter by chapter. No ML experience or prior Scala knowledge required.
+
+- [`book/markdown/Language_Model_in_Scala_V5.md`](book/markdown/Language_Model_in_Scala_V5.md) — complete book (single file)
+- [`book/pdf/Language_Model_in_Scala_V5.pdf`](book/pdf/Language_Model_in_Scala_V5.pdf) — PDF edition
+
 ## Notes
 
 - This is an educational/research-style project, not a production LLM stack.

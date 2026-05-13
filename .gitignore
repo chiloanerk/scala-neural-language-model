@@ -8,6 +8,9 @@ project/project/
 .vscode/
 *.iml
 
+# Build server
+.bsp/
+
 # OS files
 .DS_Store
 
